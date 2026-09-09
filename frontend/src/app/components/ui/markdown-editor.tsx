@@ -1,7 +1,7 @@
 "use client";
 
 import { useEditor, EditorContent, useEditorState } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
+import StarterKit, { type StarterKitOptions } from "@tiptap/starter-kit";
 import { TableKit } from "@tiptap/extension-table";
 import { Markdown } from "tiptap-markdown";
 import { useEffect, useRef, useState } from "react";
@@ -47,6 +47,12 @@ export interface MarkdownEditorProps {
    * is withheld, which is what the memory editors want.
    */
   allowTables?: boolean;
+  /**
+   * Node and mark switches for the StarterKit, merged over the defaults.
+   * Surfaces whose Markdown feeds a stricter consumer (workflow prompts)
+   * turn off constructs it cannot receive.
+   */
+  starterKit?: Partial<StarterKitOptions>;
 }
 
 function comparableMarkdown(value: string) {
@@ -130,8 +136,12 @@ export function MarkdownEditor({
   ariaLabel = "Markdown editor",
   className,
   allowTables = true,
+  starterKit,
 }: MarkdownEditorProps) {
   const lastEmittedRef = useRef(value);
+  // The first sync must check the initial content too; after that only an
+  // external change can alter what the editor holds.
+  const roundTripCheckedRef = useRef(false);
   const rawTextareaRef = useRef<HTMLTextAreaElement>(null);
   const tableInsertionSelectionRef = useRef<{
     from: number;
@@ -154,6 +164,7 @@ export function MarkdownEditor({
     extensions: [
       StarterKit.configure({
         heading: { levels: [1, 2, 3] },
+        ...starterKit,
       }),
       TableKit.configure({
         table: {
@@ -201,13 +212,35 @@ export function MarkdownEditor({
   useEffect(() => {
     if (!editor || editor.isDestroyed) return;
     const externalValueChanged = value !== lastEmittedRef.current;
-    if (value !== lastEmittedRef.current) {
+    if (externalValueChanged) {
       lastEmittedRef.current = value;
+      // Replacing the document collapses the selection to the start. When
+      // the user is mid-edit (a poll adopted a curator update, or the server
+      // normalised what was just saved) put the caret back where it was.
+      const { from, to } = editor.state.selection;
+      const restoreSelection = editor.isFocused;
       editor.commands.setContent(value, { emitUpdate: false });
+      if (restoreSelection) {
+        const size = editor.state.doc.content.size;
+        try {
+          editor.commands.setTextSelection({
+            from: Math.min(from, size),
+            to: Math.min(to, size),
+          });
+        } catch {
+          // A position that no longer exists keeps the default selection.
+        }
+      }
     }
     // Tiptap may normalize or omit Markdown syntax it cannot represent. Keep
     // such documents in the canonical raw editor so merely viewing and
-    // editing a memory file can never silently discard valid Markdown.
+    // editing a memory file can never silently discard valid Markdown. The
+    // check only means something against content the editor actually holds:
+    // after the user's own edit the document is already the source of truth
+    // (and in raw mode it is stale), so running it there produced a false
+    // "raw view preserves this Markdown" hint on every keystroke.
+    if (!externalValueChanged && roundTripCheckedRef.current) return;
+    roundTripCheckedRef.current = true;
     const roundTrips = markdownRoundTrips(value, getEditorMarkdown(editor));
     const syncFrame = window.requestAnimationFrame(() => {
       if (externalValueChanged) setRawMarkdown(value);
