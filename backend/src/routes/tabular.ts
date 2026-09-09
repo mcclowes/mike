@@ -2506,6 +2506,7 @@ tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
         reasoning: selectedReasoningLevel,
         apiKeys: api_keys,
             signal: streamAbort.signal,
+            conversationId: chatId,
             includeMemory: true,
             memoryProjectId: readableMemoryProjectId,
             memorySharedAudience,

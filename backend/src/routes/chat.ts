@@ -962,7 +962,7 @@ chatRouter.post("/", requireAuth, async (req, res) => {
     }));
     // Generate the nonce before enriching prior events so document filenames
     // and workflow titles replayed from earlier turns are fenced as well.
-    const nonce = generateSpotlightNonce();
+    const nonce = generateSpotlightNonce(chatId);
     const enrichedMessages = await enrichWithPriorEvents(
         messages,
         chatId,
@@ -1096,6 +1096,7 @@ chatRouter.post("/", requireAuth, async (req, res) => {
             apiKeys,
             signal: stream.signal,
             projectId: resolvedProjectId,
+            conversationId: chatId,
             includeMemory: true,
             memoryProjectId: canReadProjectMemory ? resolvedProjectId : null,
             memorySharedAudience,

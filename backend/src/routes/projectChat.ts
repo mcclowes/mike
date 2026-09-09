@@ -362,7 +362,7 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
     );
     // Generate the nonce before adding request metadata or prior events so
     // every document filename is fenced wherever it enters the prompt.
-    const nonce = generateSpotlightNonce();
+    const nonce = generateSpotlightNonce(chatId);
     const documentPromptRef = (documentId: string, requestFilename: string) => {
         const document = documentsById.get(documentId);
         return {
@@ -516,6 +516,7 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
             apiKeys,
             signal: streamAbort.signal,
         projectId,
+        conversationId: chatId,
         includeMemory: true,
         memoryProjectId: projectId,
         memorySharedAudience,
