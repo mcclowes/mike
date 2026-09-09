@@ -997,16 +997,12 @@ wordChatRouter.post("/", requireAuth, async (req, res) => {
   }
 
   if (lastUser && persistChat) {
-    try {
-      memoryTurn = await beginMemoryConversationTurn({
-        db,
-        surface: "word",
-        conversationId: chatId,
-        actorUserId: userId,
-      });
-    } catch (activityError) {
-      return void sendInternalError(res, activityError);
-    }
+    memoryTurn = await beginMemoryConversationTurn({
+      db,
+      surface: "word",
+      conversationId: chatId,
+      actorUserId: userId,
+    });
   }
 
   try {

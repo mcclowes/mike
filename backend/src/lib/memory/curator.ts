@@ -10,7 +10,11 @@ import {
   type OpenAIToolSchema,
   type UserApiKeys,
 } from "../llm";
-import { resolveEffectiveChatModel } from "../modelSelection";
+import {
+  hasApiKeyForModel,
+  resolveEffectiveChatModel,
+} from "../modelSelection";
+import { resolveModel } from "../llm/models";
 import { can } from "../permissions";
 import { getUserModelSettings } from "../userSettings";
 import { DbJobDeferredError, type Db, type DbJob } from "../dbq/types";
@@ -21,6 +25,7 @@ import {
   MemoryDisabledError,
   MemoryEpochSupersededError,
   MemoryJobSupersededError,
+  MemoryValidationError,
   writeMemoryFile,
   type MemoryFileRow,
   type MemoryScope,
@@ -102,12 +107,26 @@ export function memoryCuratorModelForChat(args: {
   chatModel: string;
   memoryCuratorModel?: string | null;
   environmentOverride?: string | null;
+  /**
+   * When given, a preferred model the actor has no key for falls back to the
+   * chat model instead of failing every curator run for that user. The chat
+   * model is already verified against these keys by the caller.
+   */
+  apiKeys?: UserApiKeys;
 }): string {
-  return (
+  const preferred =
     args.environmentOverride?.trim() ||
     args.memoryCuratorModel ||
-    args.chatModel
-  );
+    args.chatModel;
+  if (!args.apiKeys || preferred === args.chatModel) return preferred;
+  const canonical = resolveModel(preferred, "");
+  if (canonical && hasApiKeyForModel(canonical, args.apiKeys)) {
+    return canonical;
+  }
+  console.warn("[memory] curator model unavailable; using the chat model", {
+    preferred,
+  });
+  return args.chatModel;
 }
 
 function numeric(value: number | string): number {
@@ -754,6 +773,23 @@ export async function runMemoryCuratorScope(
               }),
             });
           } catch (error) {
+            if (error instanceof MemoryValidationError) {
+              // The model produced a body the server refuses (too large,
+              // executable HTML, control characters). That is the model's
+              // mistake, not an infrastructure failure: tell it and let it
+              // retry within this run instead of failing the job and paying
+              // for a fresh model call on every retry.
+              invalidCalls += 1;
+              results.push({
+                tool_use_id: call.id,
+                content: JSON.stringify({
+                  ok: false,
+                  error: "invalid_memory_write",
+                  detail: error.message,
+                }),
+              });
+              continue;
+            }
             if (error instanceof MemoryJobSupersededError) {
               terminalReason = "generation_superseded";
             } else if (
@@ -1049,6 +1085,23 @@ export async function handleMemoryConsolidation(
     });
     return { skipped: "superseded" };
   }
+  // The quiet gate is conversation-wide for both scopes. A later
+  // successful turn re-arms this actor's unprocessed cursor in the scheduler;
+  // this older job must not invoke a model or mark that cursor processed.
+  //
+  // The gate runs before the processing claim on purpose. An active
+  // conversation defers its job once a minute for as long as it stays active,
+  // and a deferral consumes no retry budget, so it has to be cheap: three
+  // reads, no status writes. The file status is already "scheduled" from the
+  // scheduler, so there is nothing to restore either.
+  const gate = await conversationGate(db, state, job);
+  if (gate.kind === "superseded") {
+    await refreshJobFileStatuses({ db, job, state, status: "idle" });
+    return { skipped: "newer_conversation_activity" };
+  }
+  if (gate.kind === "deferred") {
+    throw new DbJobDeferredError(gate.runAt, "memory_quiet_period");
+  }
   if (
     !(await setStatus({
       db,
@@ -1071,25 +1124,6 @@ export async function handleMemoryConsolidation(
     state,
     status: "processing",
   });
-
-  // The quiet gate is conversation-wide for both scopes. A later
-  // successful turn re-arms this actor's unprocessed cursor in the scheduler;
-  // this older job must not invoke a model or mark that cursor processed.
-  const gate = await conversationGate(db, state, job);
-  if (gate.kind === "superseded") {
-    await refreshJobFileStatuses({ db, job, state, status: "idle" });
-    return { skipped: "newer_conversation_activity" };
-  }
-  if (gate.kind === "deferred") {
-    await setStatus({
-      db,
-      stateId,
-      generation: requestedGeneration,
-      status: "idle",
-    });
-    await refreshJobFileStatuses({ db, job, state, status: "scheduled" });
-    throw new DbJobDeferredError(gate.runAt, "memory_quiet_period");
-  }
 
   const conversation = await loadConversation(db, state);
   const files: Array<{
@@ -1222,6 +1256,7 @@ export async function handleMemoryConsolidation(
     chatModel: resolved.model,
     memoryCuratorModel: settings.memory_curator_model,
     environmentOverride: process.env.MEMORY_CURATOR_MODEL,
+    apiKeys: settings.api_keys,
   });
 
   let scopeFailures = 0;
