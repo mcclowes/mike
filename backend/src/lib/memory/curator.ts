@@ -5,6 +5,7 @@ import {
   ensureReviewAccess,
   projectHasSharedAudience,
 } from "../access";
+import { hasDirectContentGrants } from "../contentAccess";
 import {
   streamChatWithTools,
   type OpenAIToolSchema,
@@ -31,6 +32,7 @@ import {
   type MemoryScope,
   type MemorySurface,
 } from "./files";
+import { MEMORY_INACTIVITY_MS } from "./schedule";
 
 const TRANSCRIPT_MESSAGE_LIMIT = 120;
 const TRANSCRIPT_CHARACTER_LIMIT = 48_000;
@@ -484,6 +486,14 @@ async function loadConversation(
     );
     if (!access.ok) return null;
     projectId = (data.project_id as string | null) ?? null;
+    // App memory may only learn from a conversation nobody else can read:
+    // the chat must be the actor's own, outside any organization, with no
+    // direct grants. This mirrors memory_source_allows_app_memory and the
+    // routes' read-side audience check.
+    appMemoryEligible =
+      data.user_id === state.actor_user_id &&
+      !data.org_id &&
+      !(await hasDirectContentGrants(db, "chat", state.conversation_id));
     if (projectId) {
       const projectAccess = await checkProjectAccess(
         projectId,
@@ -493,13 +503,14 @@ async function loadConversation(
       );
       projectWritable =
         projectAccess.ok && can(projectAccess.projectRole, "content.edit");
-      appMemoryEligible = projectAccess.ok
-        ? !(await projectHasSharedAudience(
-            db,
-            projectId,
-            projectAccess.project.org_id,
-          ))
-        : false;
+      appMemoryEligible =
+        appMemoryEligible &&
+        projectAccess.ok &&
+        !(await projectHasSharedAudience(
+          db,
+          projectId,
+          projectAccess.project.org_id,
+        ));
     }
     model = (data.model as string | null) ?? null;
     messages = await loadEligibleMemoryMessages(
@@ -555,6 +566,13 @@ async function loadConversation(
     );
     if (!access.ok) return null;
     projectId = (review.project_id as string | null) ?? null;
+    // Same boundary as chat: a tabular review learns app memory only when it
+    // is the actor's own private review inside a private project.
+    appMemoryEligible =
+      projectId !== null &&
+      review.user_id === state.actor_user_id &&
+      !review.org_id &&
+      !(await hasDirectContentGrants(db, "tabular_review", review.id as string));
     if (projectId) {
       const projectAccess = await checkProjectAccess(
         projectId,
@@ -564,13 +582,14 @@ async function loadConversation(
       );
       projectWritable =
         projectAccess.ok && can(projectAccess.projectRole, "content.edit");
-      appMemoryEligible = projectAccess.ok
-        ? !(await projectHasSharedAudience(
-            db,
-            projectId,
-            projectAccess.project.org_id,
-          ))
-        : false;
+      appMemoryEligible =
+        appMemoryEligible &&
+        projectAccess.ok &&
+        !(await projectHasSharedAudience(
+          db,
+          projectId,
+          projectAccess.project.org_id,
+        ));
     }
     model = (chat.model as string | null) ?? null;
     messages = await loadEligibleMemoryMessages(
@@ -1028,11 +1047,16 @@ async function conversationGate(
   const quietUntil =
     typeof data.quiet_until === "string" ? Date.parse(data.quiet_until) : 0;
   if (lease || (Number.isFinite(quietUntil) && quietUntil > now.getTime())) {
-    // Recheck at least once a minute while a lease is live. These deferrals do
-    // not consume the job's retry budget; release/success may retime pending
-    // work earlier than a crash-recovery lease expiry.
+    // A live lease means someone is mid-turn. The turn's own completion or
+    // release retimes this conversation's pending work, so the worker only
+    // needs a backstop: recheck when the lease dies or after one quiet
+    // window, whichever is sooner. Rechecking every minute cost a full read
+    // cycle per active conversation for as long as it stayed active.
     const retryAt = lease
-      ? Math.min(Date.parse(String(lease.expires_at)), now.getTime() + 60_000)
+      ? Math.min(
+          Date.parse(String(lease.expires_at)),
+          now.getTime() + MEMORY_INACTIVITY_MS,
+        )
       : quietUntil;
     return {
       kind: "deferred",

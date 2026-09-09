@@ -25,6 +25,9 @@ alter table public.tabular_review_chat_messages
 
 create index if not exists chat_messages_chat_created_id_idx
   on public.chat_messages(chat_id, created_at, id);
+-- (chat_id) is a strict prefix of the index above; keeping both taxes every
+-- chat message insert for nothing.
+drop index if exists public.idx_chat_messages_chat;
 create index if not exists chat_messages_author_idx
   on public.chat_messages(author_user_id) where author_user_id is not null;
 create index if not exists word_chat_messages_author_idx
@@ -182,6 +185,29 @@ create table if not exists public.memory_consolidation_results (
   created_at timestamptz not null default now(),
   primary key(job_id, memory_file_id)
 );
+-- The composite primary key cannot serve the ON DELETE CASCADE lookup from
+-- memory_files, and the retention sweep deletes by age.
+create index if not exists memory_consolidation_results_file_idx
+  on public.memory_consolidation_results(memory_file_id);
+create index if not exists memory_consolidation_results_created_idx
+  on public.memory_consolidation_results(created_at);
+-- User-referencing columns whose parent rows are deleted (account deletion)
+-- need an index or the cascade scans every memory table.
+create index if not exists memory_files_updated_by_idx
+  on public.memory_files(updated_by) where updated_by is not null;
+create index if not exists memory_consolidation_states_actor_idx
+  on public.memory_consolidation_states(actor_user_id);
+create index if not exists memory_conversation_activity_actor_idx
+  on public.memory_conversation_activity(actor_user_id)
+  where actor_user_id is not null;
+create index if not exists memory_conversation_activity_turn_actor_idx
+  on public.memory_conversation_activity(latest_turn_actor_user_id)
+  where latest_turn_actor_user_id is not null;
+create index if not exists memory_conversation_activity_project_actor_idx
+  on public.memory_conversation_activity(project_curator_actor_user_id)
+  where project_curator_actor_user_id is not null;
+create index if not exists memory_conversation_turn_leases_actor_idx
+  on public.memory_conversation_turn_leases(actor_user_id);
 
 alter table public.memory_files enable row level security;
 alter table public.memory_consolidation_states enable row level security;
@@ -203,7 +229,7 @@ create or replace function public.initialize_new_user_memory()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 begin
   insert into public.memory_files(scope, user_id, enabled)
@@ -229,7 +255,7 @@ create or replace function public.create_project_with_memory(
 returns public.projects
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   created public.projects%rowtype;
@@ -256,7 +282,7 @@ create or replace function public.lock_memory_conversation_source(
 returns table(locked_project_id uuid)
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   owner_user_id uuid;
@@ -265,6 +291,8 @@ declare
   verified_project_id uuid;
   review_id uuid;
   verified_review_id uuid;
+  review_owner_user_id uuid;
+  verified_review_owner_user_id uuid;
   word_document_id uuid;
   verified_word_document_id uuid;
 begin
@@ -315,13 +343,13 @@ begin
     resolved_project_id := null;
   elsif p_surface = 'tabular' then
     select source.user_id, source.review_id, review.user_id, review.project_id
-    into owner_user_id, review_id, verified_owner_user_id, resolved_project_id
+    into owner_user_id, review_id, review_owner_user_id, resolved_project_id
     from public.tabular_review_chats source
     join public.tabular_reviews review on review.id = source.review_id
     where source.id = p_conversation_id;
     if not found then return; end if;
     perform actor.id from auth.users actor
-    where actor.id in (p_actor_user_id, owner_user_id, verified_owner_user_id)
+    where actor.id in (p_actor_user_id, owner_user_id, review_owner_user_id)
     order by actor.id for key share;
     if resolved_project_id is not null then
       perform project.id from public.projects project
@@ -333,12 +361,14 @@ begin
     if not found then return; end if;
     select source.user_id, source.review_id, review.user_id, review.project_id
     into verified_owner_user_id, verified_review_id,
-      owner_user_id, verified_project_id
+      verified_review_owner_user_id, verified_project_id
     from public.tabular_review_chats source
     join public.tabular_reviews review on review.id = source.review_id
     where source.id = p_conversation_id for key share of source, review;
     if not found
+      or verified_owner_user_id is distinct from owner_user_id
       or verified_review_id is distinct from review_id
+      or verified_review_owner_user_id is distinct from review_owner_user_id
       or verified_project_id is distinct from resolved_project_id
     then
       raise exception using errcode = '40001', message = 'memory_source_changed';
@@ -364,7 +394,7 @@ create or replace function public.begin_memory_conversation_turn(
 returns table(conversation_generation bigint, source_epoch bigint)
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   activity public.memory_conversation_activity%rowtype;
@@ -403,9 +433,14 @@ begin
     raise exception using errcode = '40001', message = 'memory_conversation_deleted';
   end if;
 
+  -- Only garbage is reaped here. An expired lease is already ignored by every
+  -- gate, but the successful-turn scheduler proves its activity id by deleting
+  -- its own lease row: reaping a row the moment it expired made a turn that
+  -- outlived its lease (a long tool loop) silently unlearnable as soon as
+  -- anyone else spoke in the conversation.
   delete from public.memory_conversation_turn_leases
   where surface = p_surface and conversation_id = p_conversation_id
-    and expires_at <= now();
+    and expires_at <= now() - interval '1 day';
   insert into public.memory_conversation_turn_leases(
     surface, conversation_id, activity_id, actor_user_id, expires_at
   ) values (
@@ -427,11 +462,13 @@ begin
   where surface = p_surface and conversation_id = p_conversation_id;
 
   -- A claimed worker is fenced again during promotion. Pending work is moved
-  -- only a short interval so a crashed stream is retried until its lease dies.
+  -- one quiet window: a turn that completes or is released retimes it
+  -- itself, so only a crashed stream ever waits this long, and it is retried
+  -- until its lease dies.
   update public.db_jobs
   set run_at = greatest(
         run_at,
-        least(lease_until, now() + interval '1 minute')
+        least(lease_until, now() + make_interval(secs => p_quiet_seconds))
       )
   where kind = 'memory.consolidate' and status = 'pending'
     and payload->>'surface' = p_surface
@@ -439,7 +476,7 @@ begin
   update public.memory_consolidation_states
   set run_after = greatest(
         coalesce(run_after, '-infinity'::timestamptz),
-        least(lease_until, now() + interval '1 minute')
+        least(lease_until, now() + make_interval(secs => p_quiet_seconds))
       ),
       updated_at = now()
   where surface = p_surface and conversation_id = p_conversation_id
@@ -461,7 +498,7 @@ create or replace function public.release_memory_conversation_turn(
 returns boolean
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   activity public.memory_conversation_activity%rowtype;
@@ -489,8 +526,12 @@ begin
       ),
       updated_at = now()
   where surface = p_surface and conversation_id = p_conversation_id;
+  -- A released turn is the earliest this conversation can be quiet again.
+  -- Pending work moves there in both directions: later when the turn had
+  -- interrupted a nearly-due job, earlier when a worker had deferred the job
+  -- behind this turn's lease.
   update public.db_jobs
-  set run_at = greatest(run_at, next_quiet_until)
+  set run_at = next_quiet_until
   where kind = 'memory.consolidate' and status = 'pending'
     and payload->>'surface' = p_surface
     and payload->>'conversationId' = p_conversation_id::text;
@@ -515,7 +556,7 @@ create or replace function public.fence_memory_conversation_delete()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   fence_surface text := tg_argv[0];
@@ -575,6 +616,14 @@ for each row execute function public.fence_memory_conversation_delete('tabular')
 create index if not exists db_jobs_memory_conversation_pending_idx
   on public.db_jobs((payload->>'surface'), (payload->>'conversationId'))
   where kind = 'memory.consolidate' and status = 'pending';
+-- refresh_memory_file_status probes live jobs by actor/app epoch and by
+-- project/project epoch on every status transition.
+create index if not exists db_jobs_memory_app_epoch_idx
+  on public.db_jobs((payload->>'actorUserId'), (payload->>'appEpoch'))
+  where kind = 'memory.consolidate' and status in ('pending', 'running');
+create index if not exists db_jobs_memory_project_epoch_idx
+  on public.db_jobs((payload->>'projectId'), (payload->>'projectEpoch'))
+  where kind = 'memory.consolidate' and status in ('pending', 'running');
 
 -- Atomic batch claim with built-in stale-running recovery (crash resume).
 -- Storage cleanup kinds carry the only durable pointer to objects whose
@@ -696,8 +745,33 @@ create index if not exists db_jobs_failed_cleanup_run_at_idx
   where status = 'failed'
     and kind = 'storage.cleanup';
 
+drop function if exists public.memory_source_allows_app_memory(text, uuid);
+create or replace function public.memory_project_is_private(
+  p_project_id uuid
+)
+returns boolean
+language sql
+volatile
+security definer
+set search_path = public, pg_temp
+as $$
+  select exists (
+    select 1
+    from public.projects project
+    where project.id = p_project_id
+      and project.org_id is null
+      and not exists (
+        select 1
+        from public.project_access_grants grant_row
+        where grant_row.project_id = project.id
+      )
+  );
+$$;
+
 create or replace function public.memory_source_allows_app_memory(
   p_surface text,
+  p_conversation_id uuid,
+  p_actor_user_id uuid,
   p_project_id uuid
 )
 returns boolean
@@ -706,22 +780,48 @@ language sql
 -- could retain the statement's older snapshot while a concurrent share wins.
 volatile
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
+  -- App memory is private to one user, so it may only learn from a
+  -- conversation nobody else can read. That is a property of the
+  -- conversation itself (its owner, organization, and direct grants) and,
+  -- when it lives in a project, of the project too. The read path in the
+  -- routes applies the same three tests before showing app memory.
   select case
     when p_surface = 'word' then p_project_id is null
-    when p_surface = 'chat' and p_project_id is null then true
-    when p_surface in ('chat', 'tabular') and p_project_id is not null then exists (
-      select 1
-      from public.projects project
-      where project.id = p_project_id
-        and project.org_id is null
-        and not exists (
-          select 1
-          from public.project_access_grants grant_row
-          where grant_row.project_id = project.id
-        )
-    )
+    when p_surface = 'chat' then
+      exists (
+        select 1
+        from public.chats chat
+        where chat.id = p_conversation_id
+          and chat.user_id = p_actor_user_id
+          and chat.org_id is null
+          and not exists (
+            select 1
+            from public.chat_access_grants grant_row
+            where grant_row.chat_id = chat.id
+          )
+      )
+      and (
+        p_project_id is null
+        or public.memory_project_is_private(p_project_id)
+      )
+    when p_surface = 'tabular' then
+      p_project_id is not null
+      and exists (
+        select 1
+        from public.tabular_review_chats chat
+        join public.tabular_reviews review on review.id = chat.review_id
+        where chat.id = p_conversation_id
+          and review.user_id = p_actor_user_id
+          and review.org_id is null
+          and not exists (
+            select 1
+            from public.tabular_review_access_grants grant_row
+            where grant_row.tabular_review_id = review.id
+          )
+      )
+      and public.memory_project_is_private(p_project_id)
     else false
   end;
 $$;
@@ -749,7 +849,7 @@ create or replace function public.write_memory_file(
 returns table(applied boolean, new_revision bigint)
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   target public.memory_files%rowtype;
@@ -841,7 +941,7 @@ begin
     end if;
     if target.scope = 'user'
       and not public.memory_source_allows_app_memory(
-        p_source_surface, activity.project_id
+        p_source_surface, p_source_chat_id, p_updated_by, activity.project_id
       )
     then
       raise exception using errcode = '40001', message = 'memory_scope_ineligible';
@@ -856,6 +956,27 @@ begin
   end if;
   if target.revision <> p_expected_revision then
     raise exception using errcode = '40001', message = 'memory_revision_conflict';
+  end if;
+
+  -- An unchanged body is not a write: it would burn a revision and, for the
+  -- curator, look like new learning in the audit trail. The job receipt is
+  -- still stamped so a retried job is recognised above and applied once.
+  if target.content_sha256 is not distinct from p_content_sha256 then
+    if p_source_job_id is not null then
+      update public.memory_files
+      set last_source_job_id = p_source_job_id
+      where id = p_memory_file_id;
+      insert into public.memory_consolidation_results(
+        job_id, memory_file_id, scope, outcome, revision
+      ) values (
+        p_source_job_id, target.id, target.scope, 'no_change', target.revision
+      ) on conflict (job_id, memory_file_id) do update
+        set outcome = excluded.outcome,
+            revision = excluded.revision,
+            created_at = now();
+    end if;
+    return query select false, target.revision;
+    return;
   end if;
 
   update public.memory_files
@@ -911,7 +1032,7 @@ returns table(
 )
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   target public.memory_files%rowtype;
@@ -968,7 +1089,7 @@ returns table(
 )
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   target public.memory_files%rowtype;
@@ -1023,7 +1144,7 @@ create or replace function public.schedule_memory_consolidation(
 returns table(job_id uuid, generation bigint)
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   state public.memory_consolidation_states%rowtype;
@@ -1044,6 +1165,7 @@ declare
   app_turn_eligible boolean;
   app_enabled boolean;
   project_enabled boolean;
+  pending_actor_ids uuid[];
 begin
   if p_surface not in ('chat', 'word', 'tabular')
     or p_turn_id is null or p_activity_id is null
@@ -1108,7 +1230,7 @@ begin
     raise exception using errcode = '22023', message = 'invalid_memory_project';
   end if;
   app_turn_eligible := public.memory_source_allows_app_memory(
-    p_surface, canonical_project_id
+    p_surface, p_conversation_id, p_actor_user_id, canonical_project_id
   );
 
   insert into public.memory_conversation_activity(
@@ -1194,6 +1316,12 @@ begin
     and current_state.conversation_id = p_conversation_id
     and current_state.actor_user_id = p_actor_user_id
   for update;
+  if not found then
+    -- The upsert above guarantees the row; a miss means it was deleted under
+    -- us. Every later statement keys on state.id, so continuing would be a
+    -- silent no-op that looks exactly like "nothing to schedule".
+    raise exception using errcode = '40001', message = 'memory_state_missing';
+  end if;
 
   actor_cursor_advances := state.latest_terminal_message_at is null
     or (terminal_message_at, p_turn_id) >
@@ -1251,18 +1379,28 @@ begin
     on conflict do nothing;
   end if;
 
+  -- Lock every file this turn may touch, in id order, through the unique
+  -- indexes. The obvious "user_id in (subquery) or project_id = ..." shape
+  -- cannot use either index under a top-level OR and scanned (and row
+  -- locked) the whole table on every assistant turn.
+  select coalesce(array_agg(distinct pending.actor_user_id), '{}')
+  into pending_actor_ids
+  from public.memory_consolidation_states pending
+  where pending.surface = p_surface
+    and pending.conversation_id = p_conversation_id
+    and pending.latest_turn_id is not null
+    and pending.processed_generation < pending.generation;
   perform memory_file.id
   from public.memory_files memory_file
-  where (memory_file.scope = 'user' and memory_file.user_id in (
-      select pending.actor_user_id
-      from public.memory_consolidation_states pending
-      where pending.surface = p_surface
-        and pending.conversation_id = p_conversation_id
-        and pending.latest_turn_id is not null
-        and pending.processed_generation < pending.generation
-    )) or (
-      memory_file.scope = 'project'
-      and memory_file.project_id = activity.project_id
+  where memory_file.id in (
+      select locked_user_file.id from public.memory_files locked_user_file
+      where locked_user_file.scope = 'user'
+        and locked_user_file.user_id = any(pending_actor_ids)
+      union all
+      select locked_project_file.id
+      from public.memory_files locked_project_file
+      where locked_project_file.scope = 'project'
+        and locked_project_file.project_id = activity.project_id
     )
   order by memory_file.id
   for update;
@@ -1281,7 +1419,8 @@ begin
       and memory_file.user_id = queued_state.actor_user_id;
     app_enabled := coalesce(app_file.enabled, false)
       and public.memory_source_allows_app_memory(
-        p_surface, activity.project_id
+        p_surface, p_conversation_id, queued_state.actor_user_id,
+        activity.project_id
       );
     project_enabled := false;
     if activity.project_id is not null
@@ -1363,7 +1502,7 @@ create or replace function public.set_memory_consolidation_status(
 returns boolean
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   state public.memory_consolidation_states%rowtype;
@@ -1399,7 +1538,7 @@ create or replace function public.refresh_memory_file_status(
 returns boolean
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, pg_temp
 as $$
 declare
   target public.memory_files%rowtype;
@@ -1472,7 +1611,9 @@ revoke all on function public.initialize_new_user_memory()
   from public, anon, authenticated;
 revoke all on function public.lock_memory_conversation_source(text, uuid, uuid)
   from public, anon, authenticated;
-revoke all on function public.memory_source_allows_app_memory(text, uuid)
+revoke all on function public.memory_project_is_private(uuid)
+  from public, anon, authenticated;
+revoke all on function public.memory_source_allows_app_memory(text, uuid, uuid, uuid)
   from public, anon, authenticated;
 revoke all on function public.fence_memory_conversation_delete()
   from public, anon, authenticated;
@@ -1505,6 +1646,11 @@ grant execute on function public.create_project_with_memory(uuid, text, text, te
 grant execute on function public.initialize_new_user_memory()
   to service_role;
 grant execute on function public.lock_memory_conversation_source(text, uuid, uuid)
+  to service_role;
+grant execute on function public.memory_project_is_private(uuid)
+  to service_role;
+grant execute
+  on function public.memory_source_allows_app_memory(text, uuid, uuid, uuid)
   to service_role;
 grant execute on function public.fence_memory_conversation_delete()
   to service_role;

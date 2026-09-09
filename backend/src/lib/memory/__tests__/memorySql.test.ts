@@ -196,10 +196,12 @@ describe.each([
 
   it("deletes app and private-project memory transactionally", () => {
     const body = functionBody(sql, "delete_user_private_memories");
-    expect(body).toContain("lock table public.projects in share mode");
-    expect(body).toContain(
-      "lock table public.project_access_grants in share mode",
-    );
+    // Eligibility is pinned with row locks on the caller's own private
+    // projects. A table-level SHARE lock also worked, but it stalled every
+    // project write in the system from a user-facing DELETE route.
+    expect(body).not.toContain("lock table");
+    expect(body).toContain("where project.user_id = p_user_id and project.org_id is null");
+    expect(body).toContain("for update;");
     expect(body).toContain("file.scope = 'user'");
     expect(body).toContain("project.org_id is null");
     expect(body).toContain("not exists (");

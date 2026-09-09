@@ -109,8 +109,8 @@ begin
 end;
 $$;
 
--- Delete only the user's private memory files, in one transaction. A SHARE
--- lock prevents a direct grant from being inserted during scope resolution.
+-- Delete only the user's private memory files, in one transaction. Row locks
+-- on the candidate projects keep eligibility stable while they are wiped.
 create or replace function public.delete_user_private_memories(
   p_user_id uuid
 )
@@ -123,12 +123,17 @@ declare
   target record;
   deleted_projects integer := 0;
 begin
-  -- Project moves and sharing changes take ROW EXCLUSIVE locks. Hold the
-  -- conflicting SHARE locks in parent-before-child order so a project cannot
-  -- become organization-scoped or directly shared between eligibility and
-  -- erasure.
-  lock table public.projects in share mode;
-  lock table public.project_access_grants in share mode;
+  -- Lock the caller's own private projects rather than the whole table.
+  -- FOR UPDATE on a project row blocks both a move into an organization (an
+  -- UPDATE of that row) and a new access grant (the grant's foreign key takes
+  -- KEY SHARE on the project, which FOR UPDATE excludes), so eligibility
+  -- cannot change between this check and the wipe. A table-level SHARE lock
+  -- did the same job by stalling every project write in the system for as
+  -- long as this user's files took to wipe.
+  perform project.id from public.projects project
+  where project.user_id = p_user_id and project.org_id is null
+  order by project.id
+  for update;
 
   insert into public.memory_files(scope, user_id, enabled)
   values ('user', p_user_id, true)

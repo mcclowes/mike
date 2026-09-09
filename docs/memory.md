@@ -69,10 +69,13 @@ the answer being shown to the user.
   the account is created, and a new project's shared memory is enabled unless
   its creator clears the toggle. Turning either off is destructive — see
   "Disable, wipe, and deletion".
-- Standalone main chats and durable Word add-in chats may update app memory.
-  Chats and tabular reviews in a private personal project may update both app
-  and project memory. A project is private only while it has no organization
-  and no project access grants.
+- A user's own standalone main chats and durable Word add-in chats may update
+  app memory. Chats and tabular reviews in a private personal project may
+  update both app and project memory. A conversation is private only while it
+  belongs to the actor, has no organization, and has no direct access grants;
+  a project is private only while it has no organization and no project
+  access grants. The same three tests gate whether app memory is shown to the
+  model, so a conversation that cannot see private memory can never write it.
 - Organization projects and personal projects with any access grant may update
   project memory only. Their conversations never update a participant's app
   memory.
