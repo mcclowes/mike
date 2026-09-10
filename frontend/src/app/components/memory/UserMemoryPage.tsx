@@ -82,6 +82,10 @@ export function UserMemoryPage() {
     if (interactionLocked) return;
     setSettingsMutation("enable");
     setError(null);
+    // A refusal from the disabled period ("your changes were not saved") is
+    // over once memory is on again; leaving it up next to the fresh file
+    // reads as if the new file were already failing.
+    setAutosaveError(null);
     try {
       syncCurrent(await setUserMemoryEnabled(true));
     } catch (cause) {

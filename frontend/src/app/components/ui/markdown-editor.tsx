@@ -675,7 +675,10 @@ export function MarkdownEditor({
         </div>
       )}
       <div
-        className={`flex-1 overflow-y-auto transition-opacity ${
+        // A flex column so the raw textarea can take the whole editing area:
+        // `h-full` alone resolves to "auto" inside a flex item without an
+        // explicit height, which left the raw view two rows tall.
+        className={`flex flex-1 flex-col overflow-y-auto transition-opacity ${
           readOnly ? "border-t border-gray-100" : ""
         } ${suspended ? "opacity-50" : ""}`}
       >
@@ -686,7 +689,7 @@ export function MarkdownEditor({
             onChange={(event) => handleRawChange(event.target.value)}
             readOnly={readOnly || suspended}
             spellCheck={false}
-            className="h-full min-h-full w-full resize-none bg-transparent px-5 py-4 font-mono text-xs leading-6 text-gray-800 outline-none placeholder:text-gray-400 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-600/40 read-only:cursor-default"
+            className="h-full min-h-full w-full flex-1 resize-none bg-transparent px-5 py-4 font-mono text-xs leading-6 text-gray-800 outline-none placeholder:text-gray-400 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-600/40 read-only:cursor-default"
             aria-label={`${ariaLabel} (raw Markdown)`}
           />
         ) : (
