@@ -274,6 +274,10 @@ drop function if exists public.invalidate_memory_conversation(
   text, uuid, uuid, uuid, uuid
 );
 
+-- Conflicts raise P0001, never 40001: PostgREST treats a serialization
+-- failure as retryable and never answers the request, which hung every
+-- manual write that lost a compare-and-swap race and every curator job that
+-- hit a superseded generation.
 create or replace function public.lock_memory_conversation_source(
   p_surface text,
   p_conversation_id uuid,
@@ -317,7 +321,7 @@ begin
       or verified_owner_user_id is distinct from owner_user_id
       or verified_project_id is distinct from resolved_project_id
     then
-      raise exception using errcode = '40001', message = 'memory_source_changed';
+      raise exception using errcode = 'P0001', message = 'memory_source_changed';
     end if;
   elsif p_surface = 'word' then
     select source.user_id, source.word_document_id
@@ -338,7 +342,7 @@ begin
       or verified_owner_user_id is distinct from owner_user_id
       or verified_word_document_id is distinct from word_document_id
     then
-      raise exception using errcode = '40001', message = 'memory_source_changed';
+      raise exception using errcode = 'P0001', message = 'memory_source_changed';
     end if;
     resolved_project_id := null;
   elsif p_surface = 'tabular' then
@@ -371,7 +375,7 @@ begin
       or verified_review_owner_user_id is distinct from review_owner_user_id
       or verified_project_id is distinct from resolved_project_id
     then
-      raise exception using errcode = '40001', message = 'memory_source_changed';
+      raise exception using errcode = 'P0001', message = 'memory_source_changed';
     end if;
   else
     raise exception using errcode = '22023', message = 'invalid_memory_surface';
@@ -419,7 +423,7 @@ begin
     p_surface, p_conversation_id, p_actor_user_id
   ) locked;
   if not found then
-    raise exception using errcode = '40001', message = 'memory_conversation_deleted';
+    raise exception using errcode = 'P0001', message = 'memory_conversation_deleted';
   end if;
 
   insert into public.memory_conversation_activity(
@@ -430,7 +434,7 @@ begin
   select * into activity from public.memory_conversation_activity
   where surface = p_surface and conversation_id = p_conversation_id for update;
   if activity.deleted_at is not null then
-    raise exception using errcode = '40001', message = 'memory_conversation_deleted';
+    raise exception using errcode = 'P0001', message = 'memory_conversation_deleted';
   end if;
 
   -- Only garbage is reaped here. An expired lease is already ignored by every
@@ -880,7 +884,7 @@ begin
       p_source_surface, p_source_chat_id, p_updated_by
     ) locked;
     if not found then
-      raise exception using errcode = '40001', message = 'memory_job_superseded';
+      raise exception using errcode = 'P0001', message = 'memory_job_superseded';
     end if;
     select * into activity from public.memory_conversation_activity
     where surface = p_source_surface and conversation_id = p_source_chat_id
@@ -890,7 +894,7 @@ begin
       or activity.source_epoch <> p_source_epoch
       or activity.generation <> p_conversation_generation
     then
-      raise exception using errcode = '40001', message = 'memory_job_superseded';
+      raise exception using errcode = 'P0001', message = 'memory_job_superseded';
     end if;
     if activity.quiet_until is null
       or activity.quiet_until > now()
@@ -913,7 +917,7 @@ begin
       or consolidation.source_epoch <> p_source_epoch
       or consolidation.actor_user_id is distinct from p_updated_by
     then
-      raise exception using errcode = '40001', message = 'memory_job_superseded';
+      raise exception using errcode = 'P0001', message = 'memory_job_superseded';
     end if;
   end if;
 
@@ -937,14 +941,14 @@ begin
     if (target.scope = 'user' and target.user_id <> consolidation.actor_user_id)
       or (target.scope = 'project' and target.project_id is distinct from consolidation.project_id)
     then
-      raise exception using errcode = '40001', message = 'memory_job_superseded';
+      raise exception using errcode = 'P0001', message = 'memory_job_superseded';
     end if;
     if target.scope = 'user'
       and not public.memory_source_allows_app_memory(
         p_source_surface, p_source_chat_id, p_updated_by, activity.project_id
       )
     then
-      raise exception using errcode = '40001', message = 'memory_scope_ineligible';
+      raise exception using errcode = 'P0001', message = 'memory_scope_ineligible';
     end if;
   end if;
 
@@ -952,10 +956,10 @@ begin
     raise exception using errcode = 'P0001', message = 'memory_disabled';
   end if;
   if target.epoch <> p_expected_epoch then
-    raise exception using errcode = '40001', message = 'memory_epoch_conflict';
+    raise exception using errcode = 'P0001', message = 'memory_epoch_conflict';
   end if;
   if target.revision <> p_expected_revision then
-    raise exception using errcode = '40001', message = 'memory_revision_conflict';
+    raise exception using errcode = 'P0001', message = 'memory_revision_conflict';
   end if;
 
   -- An unchanged body is not a write: it would burn a revision and, for the
@@ -1320,7 +1324,7 @@ begin
     -- The upsert above guarantees the row; a miss means it was deleted under
     -- us. Every later statement keys on state.id, so continuing would be a
     -- silent no-op that looks exactly like "nothing to schedule".
-    raise exception using errcode = '40001', message = 'memory_state_missing';
+    raise exception using errcode = 'P0001', message = 'memory_state_missing';
   end if;
 
   actor_cursor_advances := state.latest_terminal_message_at is null
