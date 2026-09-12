@@ -1,4 +1,16 @@
-import type { Document, LibraryFolder, Project, Workflow } from "../types";
+import type {
+  ApiKeyStatus,
+  Document,
+  LibraryFolder,
+  Project,
+  Workflow,
+} from "../types";
+
+// Re-exported so existing imports keep working; the definition lives in
+// ../types so cross-package type-only consumers (frontend/src/wordAddin
+// parity tests) never pull this module, and its runtime imports, into
+// the web app's type-check graph.
+export type { ApiKeyStatus } from "../types";
 import { describeNetworkFailure } from "../lib/networkError";
 import { reportApiFailure, reportNetworkFailure } from "../lib/errorReporting";
 import type { ReasoningLevel } from "../lib/wordChatTypes";
@@ -290,27 +302,6 @@ export async function updateLastSelectedReasoningLevel(
   });
 }
 
-export interface ApiKeyStatus {
-  claude: boolean;
-  gemini: boolean;
-  openai: boolean;
-  openrouter: boolean;
-  vercel: boolean;
-  "opencode-go": boolean;
-  courtlistener: boolean;
-  sources?: Partial<
-    Record<
-      | "claude"
-      | "gemini"
-      | "openai"
-      | "openrouter"
-      | "vercel"
-      | "opencode-go"
-      | "courtlistener",
-      "user" | "env" | null
-    >
-  >;
-}
 
 export async function getApiKeyStatus(): Promise<ApiKeyStatus> {
   return apiRequest<ApiKeyStatus>("/user/api-keys");
