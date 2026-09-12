@@ -1,7 +1,7 @@
 "use client";
 
 import { useEditor, EditorContent, useEditorState } from "@tiptap/react";
-import StarterKit, { type StarterKitOptions } from "@tiptap/starter-kit";
+import StarterKit from "@tiptap/starter-kit";
 import { TableKit } from "@tiptap/extension-table";
 import { Markdown } from "tiptap-markdown";
 import { useEffect, useRef, useState } from "react";
@@ -47,12 +47,6 @@ export interface MarkdownEditorProps {
    * is withheld, which is what the memory editors want.
    */
   allowTables?: boolean;
-  /**
-   * Node and mark switches for the StarterKit, merged over the defaults.
-   * Surfaces whose Markdown feeds a stricter consumer (workflow prompts)
-   * turn off constructs it cannot receive.
-   */
-  starterKit?: Partial<StarterKitOptions>;
 }
 
 function comparableMarkdown(value: string) {
@@ -136,7 +130,6 @@ export function MarkdownEditor({
   ariaLabel = "Markdown editor",
   className,
   allowTables = true,
-  starterKit,
 }: MarkdownEditorProps) {
   const lastEmittedRef = useRef(value);
   // The first sync must check the initial content too; after that only an
@@ -164,7 +157,6 @@ export function MarkdownEditor({
     extensions: [
       StarterKit.configure({
         heading: { levels: [1, 2, 3] },
-        ...starterKit,
       }),
       TableKit.configure({
         table: {
