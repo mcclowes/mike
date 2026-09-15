@@ -39,11 +39,15 @@ export default function MikeLayout({
         return true;
     });
 
-    // Persist the desktop preference — that is the value the restore path above
-    // reads back into isSidebarOpenDesktop on the next mount.
+    // Persist what is actually on screen. The mount initializer above reads
+    // this key back but `isSidebarOpen` starts open on desktop regardless, so
+    // storing anything else leaves the restored preference disagreeing with
+    // the rendered sidebar and the first toggle click is spent re-syncing
+    // them. Remembering a collapsed sidebar across reloads needs the mount
+    // path to apply the stored value too — a separate change.
     useEffect(() => {
         if (typeof window !== "undefined" && window.innerWidth >= 768) {
-            localStorage.setItem("sidebarOpen", isSidebarOpenDesktop.toString());
+            localStorage.setItem("sidebarOpen", isSidebarOpen.toString());
         }
     }, [isSidebarOpenDesktop]);
 
