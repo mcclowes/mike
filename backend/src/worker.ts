@@ -17,8 +17,12 @@
 // never noticed because compose injects real environment variables.
 import "dotenv/config";
 
+import { enforceDocumentLifecycleMigration } from "./lib/dbq/lifecycleGuard";
 import { startAllWorkers, stopAllWorkers } from "./workerRuntime";
 
+// A worker against an unmigrated database cannot run the cleanup kind at all,
+// so it would fail every row it claims. Say so once, loudly, and stop.
+void enforceDocumentLifecycleMigration();
 startAllWorkers();
 
 // KEEPALIVE. Everything startAllWorkers() creates is deliberately unref'd —

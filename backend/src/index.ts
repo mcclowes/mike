@@ -1,6 +1,7 @@
 import { Worker as ThreadWorker } from "node:worker_threads";
 import path from "node:path";
 import { app } from "./app";
+import { enforceDocumentLifecycleMigration } from "./lib/dbq/lifecycleGuard";
 import { manifestPublicKey } from "./lib/manifestSigning";
 import { validateRuntimeConfiguration } from "./lib/runtimeConfig";
 import { startAllWorkers, stopAllWorkers } from "./workerRuntime";
@@ -72,6 +73,10 @@ const server = app.listen(PORT, () => {
   console.log(
     `Mike backend running on port ${PORT} (workers: ${WORKERS_MODE})`,
   );
+  // Deploying this code against a database that has not run the
+  // document-lifecycle migration leaks storage silently — see lifecycleGuard.
+  // Checked after listen so the probe's own latency never delays binding.
+  void enforceDocumentLifecycleMigration();
   if (WORKERS_MODE === "thread") {
     spawnWorkerThread();
   } else if (WORKERS_MODE === "inline") {
