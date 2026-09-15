@@ -54,6 +54,11 @@ export function usePaginatedProjects(options: {
     const [selectingAllRequest, setSelectingAllRequest] = useState(false);
     const [retryVersion, setRetryVersion] = useState(0);
     const requestVersionRef = useRef(0);
+    // Select-all owns its own counter. requestVersionRef tracks the list
+    // query, and a search/scope/sort change bumps it while an ids request is
+    // still in flight — gating the "done" flag on that version left the
+    // header checkbox disabled until the next full reload.
+    const selectAllRequestRef = useRef(0);
     const loadingMoreRef = useRef(false);
     const loadMoreControllerRef = useRef<AbortController | null>(null);
 
@@ -249,6 +254,7 @@ export function usePaginatedProjects(options: {
         }
 
         const requestVersion = requestVersionRef.current;
+        const selectAllRequest = ++selectAllRequestRef.current;
         setSelectingAllRequest(true);
         try {
             const rows = await listProjectIds({
@@ -275,7 +281,10 @@ export function usePaginatedProjects(options: {
                 );
             }
         } finally {
-            if (requestVersion === requestVersionRef.current) {
+            // Clear for the request that set the flag, whatever the list
+            // query has moved on to meanwhile. A newer select-all owns the
+            // flag instead.
+            if (selectAllRequest === selectAllRequestRef.current) {
                 setSelectingAllRequest(false);
             }
         }
