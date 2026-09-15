@@ -876,17 +876,20 @@ export function TRChatPanel({
     }
 
     // Detach whatever is still streaming from the message list: stop the
-    // reader, stop the 16ms drip timer, and retire the generation so the
-    // in-flight loop stops writing into a list it no longer owns.
-    function cancelActiveStream() {
+    // 16ms drip timer and retire the generation so the in-flight loop stops
+    // writing into a list it no longer owns. Deliberately does NOT abort —
+    // the backend reads a closed socket as a cancellation and persists a
+    // truncated "Cancelled by user." answer, so closing the panel or
+    // switching chats must let the request run to completion. Only
+    // handleCancel (the Stop control) aborts.
+    function detachActiveStream() {
         streamGenerationRef.current += 1;
         stopDrip();
-        abortRef.current?.abort();
     }
 
     // This panel is conditionally mounted, so without a cleanup the drip
-    // interval and the open reader survive it.
-    useEffect(() => cancelActiveStream, []); // eslint-disable-line react-hooks/exhaustive-deps
+    // interval survives it.
+    useEffect(() => detachActiveStream, []); // eslint-disable-line react-hooks/exhaustive-deps
 
     function updateLastContentEvent(
         prev: TRMessage[],
@@ -1036,7 +1039,7 @@ export function TRChatPanel({
     // ---- chat actions ----
 
     function handleNewChat() {
-        cancelActiveStream();
+        detachActiveStream();
         setCurrentChatId(null);
         setCurrentChatTitle(null);
         setCurrentChatModel(null);
@@ -1074,7 +1077,7 @@ export function TRChatPanel({
     }
 
     async function handleLoadChat(chatId: string) {
-        cancelActiveStream();
+        detachActiveStream();
         const chat = chats.find((c) => c.id === chatId);
         setCurrentChatId(chatId);
         setCurrentChatTitle(chat?.title ?? null);
@@ -1130,7 +1133,7 @@ export function TRChatPanel({
             }
         }, 50);
 
-        cancelActiveStream();
+        detachActiveStream();
         const gen = streamGenerationRef.current;
         dripTargetRef.current = "";
         dripDisplayLenRef.current = 0;
@@ -1152,8 +1155,11 @@ export function TRChatPanel({
             for await (const frame of readSseFrames(response, {
                 signal: controller.signal,
             })) {
-                // Another chat owns the message list now — stop writing.
-                if (streamGenerationRef.current !== gen) break;
+                // Another chat owns the message list now — stop writing,
+                // but keep draining: breaking out cancels the reader, which
+                // closes the socket and makes the server persist a
+                // truncated answer.
+                if (streamGenerationRef.current !== gen) continue;
 
                 const data = frame as Record<string, unknown>;
 
@@ -1669,7 +1675,7 @@ export function TRChatPanel({
             });
         } catch (err: unknown) {
             // Superseded stream: the list it would repaint is someone
-            // else's now (including the abort fired on unmount).
+            // else's now.
             if (streamGenerationRef.current !== gen) return;
 
             const isAbort = err instanceof Error && err.name === "AbortError";

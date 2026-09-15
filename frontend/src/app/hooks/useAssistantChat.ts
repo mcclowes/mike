@@ -96,18 +96,30 @@ export function useAssistantChat({
   // draining.
   const generationRef = useRef(0);
 
+  // Remembers the generation the unmount cleanup retired, so a StrictMode
+  // re-mount (dev runs mount → cleanup → mount on the same hook instance)
+  // can re-adopt the turn it just detached instead of orphaning it.
+  const detachedGenerationRef = useRef<number | null>(null);
+
   const eventsRef = useRef<AssistantEvent[]>([]);
 
-  // Nothing else stops an in-flight turn when the chat goes away: without
-  // this the reader keeps the connection open and keeps calling setState on
-  // an unmounted hook.
-  useEffect(
-    () => () => {
+  // Detach — never abort — an in-flight turn when the chat goes away.
+  // The server treats a closed socket as a user cancellation
+  // (routeStreaming's `res.on("close")`) and persists a truncated
+  // "Cancelled by user." answer, so aborting here would destroy the answer
+  // of anyone who clicks a sidebar link mid-stream. Retiring the generation
+  // is enough: the loop drains the rest of the body without touching this
+  // hook's state. Only the explicit Stop control aborts.
+  useEffect(() => {
+    if (detachedGenerationRef.current !== null) {
+      generationRef.current = detachedGenerationRef.current;
+      detachedGenerationRef.current = null;
+    }
+    return () => {
+      detachedGenerationRef.current = generationRef.current;
       generationRef.current += 1;
-      abortControllerRef.current?.abort();
-    },
-    [],
-  );
+    };
+  }, []);
 
   const updateLatestAssistantMessage = (
     updater: (message: Message) => Message,
@@ -279,8 +291,9 @@ export function useAssistantChat({
     if (!message.content.trim()) return null;
 
     // Supersede any turn still streaming — its loop appends into the same
-    // eventsRef this turn is about to reset.
-    abortControllerRef.current?.abort();
+    // eventsRef this turn is about to reset. Detach it (bump the
+    // generation) rather than abort it, so its answer still finishes and is
+    // persisted server-side.
     const gen = ++generationRef.current;
 
     setIsResponseLoading(true);
@@ -413,8 +426,11 @@ export function useAssistantChat({
       for await (const frame of readSseFrames(response, {
         signal: controller.signal,
       })) {
-        // A newer turn (or an unmount) owns eventsRef now — stop writing.
-        if (generationRef.current !== gen) break;
+        // A newer turn (or an unmount) owns eventsRef now — stop writing,
+        // but keep draining. Breaking out here would cancel the reader,
+        // which closes the socket and makes the server persist a truncated
+        // answer; the caller wanted a different chat, not a cancellation.
+        if (generationRef.current !== gen) continue;
 
         const data = frame as Record<string, unknown>;
 
@@ -1334,8 +1350,8 @@ export function useAssistantChat({
 
       return streamedChatId || null;
     } catch (error: unknown) {
-      // A superseded turn — including the abort this hook fires on unmount —
-      // must not repaint the message list the new turn now owns.
+      // A superseded turn must not repaint the message list the new turn
+      // (or the next mount) now owns.
       if (generationRef.current !== gen) return null;
 
       if (error instanceof Error && error.name === "AbortError") {
