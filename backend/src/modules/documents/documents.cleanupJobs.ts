@@ -233,7 +233,13 @@ async function deleteCleanupKeys(
 /** Operational queue-disable fallback. Normally the trigger is the only
  * collector. With workers explicitly disabled, retain a request-local copy
  * so erasure still removes bytes inline; the trigger remains the durable retry
- * record if storage fails. Callers must authorize the supplied scope first. */
+ * record if storage fails. Callers must authorize the supplied scope first.
+ *
+ * BEST-EFFORT, ALWAYS. This runs BEFORE the rows are deleted, so anything it
+ * throws cancels a delete the user asked for and is allowed to have. An
+ * unconfigured object store or a failed lookup costs us the inline snapshot,
+ * nothing more: the trigger still records the cleanup intent, and a runner
+ * picks it up whenever one exists again. */
 export async function captureInlineDocumentCleanup(
   db: Db,
   scope:
@@ -243,40 +249,45 @@ export async function captureInlineDocumentCleanup(
     | { workflowId: string },
 ): Promise<string[]> {
   if (process.env.DB_JOBS_ENABLED !== "false") return [];
-  assertStorageConfigured();
-  let ids: string[];
-  if ("documentIds" in scope) ids = scope.documentIds;
-  else if ("versionIds" in scope) ids = scope.versionIds;
-  else {
-    const query = db.from("documents").select("id");
-    const { data, error } =
-      "projectIds" in scope
-        ? await query.in("project_id", scope.projectIds)
-        : await query.eq("workflow_id", scope.workflowId);
-    if (error) throw error;
-    ids = (data ?? []).map((row) => row.id as string);
-  }
-  const keys = new Set<string>();
-  for (let start = 0; start < ids.length; start += 500) {
-    const { data, error } = await db
-      .from("document_versions")
-      .select("id, storage_path, pdf_storage_path")
-      .in(
-        "versionIds" in scope ? "id" : "document_id",
-        ids.slice(start, start + 500),
-      );
-    if (error) throw error;
-    for (const row of data ?? []) {
-      for (const key of [
-        row.storage_path,
-        row.pdf_storage_path,
-        extractedTextKey(row.id),
-      ]) {
-        if (typeof key === "string" && key) keys.add(key);
+  try {
+    assertStorageConfigured();
+    let ids: string[];
+    if ("documentIds" in scope) ids = scope.documentIds;
+    else if ("versionIds" in scope) ids = scope.versionIds;
+    else {
+      const query = db.from("documents").select("id");
+      const { data, error } =
+        "projectIds" in scope
+          ? await query.in("project_id", scope.projectIds)
+          : await query.eq("workflow_id", scope.workflowId);
+      if (error) throw error;
+      ids = (data ?? []).map((row) => row.id as string);
+    }
+    const keys = new Set<string>();
+    for (let start = 0; start < ids.length; start += 500) {
+      const { data, error } = await db
+        .from("document_versions")
+        .select("id, storage_path, pdf_storage_path")
+        .in(
+          "versionIds" in scope ? "id" : "document_id",
+          ids.slice(start, start + 500),
+        );
+      if (error) throw error;
+      for (const row of data ?? []) {
+        for (const key of [
+          row.storage_path,
+          row.pdf_storage_path,
+          extractedTextKey(row.id),
+        ]) {
+          if (typeof key === "string" && key) keys.add(key);
+        }
       }
     }
+    return [...keys];
+  } catch (err) {
+    logError("documents/inline-cleanup", err, { phase: "capture" });
+    return [];
   }
-  return [...keys];
 }
 
 /**
@@ -284,12 +295,28 @@ export async function captureInlineDocumentCleanup(
  * the second: inline deletion for the queue-disabled fallback, then a
  * delivery request for the rows the version trigger just wrote, so a Redis
  * deployment starts draining in milliseconds instead of at the next 60s poll.
+ *
+ * NEVER THROWS. Every caller runs this AFTER the rows are gone. The job form
+ * of this work signals a retry by throwing — that is how the runner knows to
+ * come back — but on a request thread the same throw turns a completed delete
+ * into a 500 and, on the account-erasure path, abandons the cascade partway
+ * through. The db_jobs row the trigger wrote is the durable record, so
+ * logging and continuing loses nothing but the head start.
  */
 export async function completeInlineDocumentCleanup(
   db: Db,
   keys: string[],
 ): Promise<void> {
-  if (keys.length) await handleDocumentCleanup(db, { payload: { keys } });
+  if (keys.length) {
+    try {
+      await handleDocumentCleanup(db, { payload: { keys } });
+    } catch (err) {
+      logError("documents/inline-cleanup", err, {
+        phase: "complete",
+        keys: keys.length,
+      });
+    }
+  }
   await requestDocumentCleanupDelivery(db);
 }
 
@@ -320,7 +347,12 @@ export async function captureInlineVersionUpdateCleanup(
     .eq("document_id", documentId)
     .is("deleted_at", null)
     .maybeSingle();
-  if (error) throw error;
+  // Same best-effort rule as the scoped capture above: this runs before the
+  // write it snapshots, so it must never be the reason the write is refused.
+  if (error) {
+    logError("documents/inline-cleanup", error, { phase: "capture-version" });
+    return [];
+  }
   if (!previous) return [];
   const keys = new Set<string>();
   let invalidateCache = false;

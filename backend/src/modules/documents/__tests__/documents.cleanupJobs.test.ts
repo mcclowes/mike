@@ -19,7 +19,10 @@ import {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  storage.deleteFile.mockResolvedValue(undefined);
+  // clearAllMocks clears calls, not implementations: reset both so a test
+  // that makes storage fail cannot leak into the next one.
+  storage.deleteFile.mockReset().mockResolvedValue(undefined);
+  storage.assertStorageConfigured.mockReset();
 });
 afterEach(() => vi.unstubAllEnvs());
 const job = (keys: unknown[]) => ({ payload: { keys } });
@@ -260,6 +263,50 @@ describe("document cleanup job", () => {
       ["eq", "status", "pending"],
       ["limit", 5],
     ]);
+    fake.done();
+  });
+
+  // The job form throws to ask the runner for a retry. On a request thread
+  // the same throw would 500 a delete that has already happened.
+  it("never fails the request when inline deletion fails", async () => {
+    vi.stubEnv("DB_JOBS_ENABLED", "false");
+    const fake = coalescingDb([
+      { table: "document_versions", data: [] },
+      { table: "document_versions", data: [] },
+    ]);
+    storage.deleteFile.mockRejectedValue(new Error("storage unavailable"));
+    await expect(
+      completeInlineDocumentCleanup(fake.db, ["gone"]),
+    ).resolves.toBeUndefined();
+    fake.done();
+  });
+
+  it("never fails the request when the object store is unconfigured", async () => {
+    vi.stubEnv("DB_JOBS_ENABLED", "false");
+    storage.assertStorageConfigured.mockImplementation(() => {
+      throw new Error("R2_ENDPOINT_URL ... must be set");
+    });
+    const fake = coalescingDb([]);
+    // The capture runs BEFORE the rows are deleted: throwing here would
+    // refuse a delete the user is entitled to.
+    expect(
+      await captureInlineDocumentCleanup(fake.db, { documentIds: ["doc"] }),
+    ).toEqual([]);
+    await expect(
+      completeInlineDocumentCleanup(fake.db, ["gone"]),
+    ).resolves.toBeUndefined();
+    expect(storage.deleteFile).not.toHaveBeenCalled();
+    fake.done();
+  });
+
+  it("leaves the durable row alone when the inline snapshot cannot be taken", async () => {
+    vi.stubEnv("DB_JOBS_ENABLED", "false");
+    const fake = coalescingDb([
+      { table: "documents", error: { message: "database unavailable" } },
+    ]);
+    expect(
+      await captureInlineDocumentCleanup(fake.db, { projectIds: ["p1"] }),
+    ).toEqual([]);
     fake.done();
   });
 

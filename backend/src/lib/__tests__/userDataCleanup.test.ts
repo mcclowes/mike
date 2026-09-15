@@ -711,6 +711,23 @@ describe("deleteUserAccountData", () => {
         expect(listFilesMock).toHaveBeenCalledWith("exports/u1/");
     });
 
+    // Erasure's last steps are org settlement and — in the caller — the auth
+    // user itself. An object store that refuses DELETE must not abort the
+    // cascade before them: that combination leaves the content erased and the
+    // login still working. The trigger's db_jobs rows stay pending, so the
+    // bytes are still owned by a retryable record.
+    it("finishes the cascade when the object store refuses a delete", async () => {
+        const { db, tables } = fixture();
+        deleteFileMock.mockRejectedValue(new Error("storage unavailable"));
+        await expect(
+            deleteUserAccountData(db, "u1", "u1@example.com"),
+        ).resolves.toBeUndefined();
+        expect(deleteFileMock).toHaveBeenCalled();
+        // Everything after the cleanup step still ran.
+        expect(ids(tables.documents)).toEqual(["d-other"]);
+        expect(ids(tables.projects)).toEqual(["p-other"]);
+    });
+
     it("treats document/workflow prefix cleanup as best-effort", async () => {
         const { db, tables } = fixture();
         // Orphan sweep failing is tolerable: version-linked files were
