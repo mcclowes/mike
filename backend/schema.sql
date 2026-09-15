@@ -6710,12 +6710,27 @@ $$;
 revoke all on function public.activate_document_version(uuid, uuid) from public, anon, authenticated;
 grant execute on function public.activate_document_version(uuid, uuid) to service_role;
 
+
+-- Kind-scoped claim scan: the document.cleanup handler coalesces its pending
+-- siblings into one pass instead of draining them a poll batch at a time.
+create index if not exists db_jobs_pending_kind_idx
+  on public.db_jobs (kind, run_at)
+  where status = 'pending';
+
 -- Cleanup intents survive stale claims and old workers rejecting a new kind
 -- during migration-before-code rollout. Both poll and Redis claim paths revive
 -- failed cleanup rows; ordinary jobs retain their finite attempt budgets.
+-- Revival is gated on run_at and pushes run_at forward on every claim, so a
+-- runner that cannot execute the kind backs off instead of hot-looping.
+--
+-- The 2-argument signature is dropped rather than overloaded: Postgres cannot
+-- resolve claim_db_jobs(5, 600) when both a 2-arg and a 3-arg (defaulted)
+-- candidate exist.
+drop function if exists public.claim_db_jobs(integer, integer);
 create or replace function public.claim_db_jobs(
   p_limit integer default 5,
-  p_stale_seconds integer default 600
+  p_stale_seconds integer default 600,
+  p_kind text default null
 )
 returns setof public.db_jobs
 language sql set search_path = ''
@@ -6736,15 +6751,17 @@ as $$
   ), candidates as (
     select id
       from public.db_jobs
-     where (status = 'pending' and run_at <= now())
+     where (p_kind is null or kind = p_kind)
+       and ((status = 'pending' and run_at <= now())
         or (status = 'failed'
-            and kind in ('storage.cleanup', 'document.cleanup'))
+            and kind in ('storage.cleanup', 'document.cleanup')
+            and run_at <= now())
         or (status = 'running'
             and claimed_at < now() - make_interval(secs => p_stale_seconds)
             and (
               attempts < max_attempts
               or kind in ('storage.cleanup', 'document.cleanup')
-            ))
+            )))
      order by run_at
      limit p_limit
        for update skip locked
@@ -6763,6 +6780,15 @@ as $$
              then 2147483647
            else j.max_attempts
          end,
+         run_at = case
+           when j.status = 'failed'
+             and j.kind in ('storage.cleanup', 'document.cleanup')
+             then now() + least(
+               interval '10 minutes',
+               make_interval(secs => 30 * least(j.attempts::bigint + 1, 20))
+             )
+           else j.run_at
+         end,
          dedupe_key = case
            when j.status = 'failed'
              and j.kind in ('storage.cleanup', 'document.cleanup')
@@ -6773,6 +6799,10 @@ as $$
    where j.id = c.id
   returning j.*;
 $$;
+revoke all on function public.claim_db_jobs(integer, integer, text)
+  from public, anon, authenticated;
+grant execute on function public.claim_db_jobs(integer, integer, text)
+  to service_role;
 
 -- Claim ONE job by id — the Redis-delivery path (transactional-outbox
 -- pattern). When Redis is configured, enqueue also adds a BullMQ "delivery"
@@ -6805,6 +6835,15 @@ as $$
              then 2147483647
            else j.max_attempts
          end,
+         run_at = case
+           when j.status = 'failed'
+             and j.kind in ('storage.cleanup', 'document.cleanup')
+             then now() + least(
+               interval '10 minutes',
+               make_interval(secs => 30 * least(j.attempts::bigint + 1, 20))
+             )
+           else j.run_at
+         end,
          dedupe_key = case
            when j.status = 'failed'
              and j.kind in ('storage.cleanup', 'document.cleanup')
@@ -6814,7 +6853,8 @@ as $$
    where j.id = p_id
      and ((j.status = 'pending' and j.run_at <= now())
        or (j.status = 'failed'
-           and j.kind in ('storage.cleanup', 'document.cleanup'))
+           and j.kind in ('storage.cleanup', 'document.cleanup')
+           and j.run_at <= now())
        or (j.status = 'running'
            and j.claimed_at < now() - make_interval(secs => p_stale_seconds)
            and (
@@ -6823,9 +6863,42 @@ as $$
            )))
   returning j.*;
 $$;
+revoke all on function public.claim_db_job(uuid, integer)
+  from public, anon, authenticated;
+grant execute on function public.claim_db_job(uuid, integer)
+  to service_role;
 
 drop index if exists public.db_jobs_failed_cleanup_run_at_idx;
 create index db_jobs_failed_cleanup_run_at_idx
   on public.db_jobs(run_at)
   where status = 'failed'
     and kind in ('storage.cleanup', 'document.cleanup');
+
+-- Rollout probe. Returns 1 only when every lifecycle RPC the documents module
+-- calls exists; 0 when the document-lifecycle migration has not been applied.
+-- A missing function makes the RPC itself unresolvable (PostgREST PGRST202),
+-- which the backend treats the same way — see lib/dbq/lifecycleGuard.ts.
+create or replace function public.document_lifecycle_version()
+returns integer
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select case when (
+    select count(distinct p.proname)
+      from pg_catalog.pg_proc p
+      join pg_catalog.pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'public'
+       and p.proname in (
+         'create_document_version',
+         'create_document_versions',
+         'activate_document_version',
+         'delete_document_version',
+         'queue_document_version_cleanup'
+       )
+  ) = 5 then 1 else 0 end;
+$$;
+revoke all on function public.document_lifecycle_version()
+  from public, anon, authenticated;
+grant execute on function public.document_lifecycle_version() to service_role;

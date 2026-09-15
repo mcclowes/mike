@@ -1,12 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { scriptedDb } from "../../../__tests__/helpers/scriptedDb";
 const cleanup = vi.hoisted(() => vi.fn());
-vi.mock("../../../lib/dbq/enqueue", () => ({ enqueueStorageCleanup: cleanup }));
+const requestDelivery = vi.hoisted(() => vi.fn());
+vi.mock("../../../lib/dbq/enqueue", () => ({
+  enqueueStorageCleanup: cleanup,
+  requestDocumentCleanupDelivery: requestDelivery,
+}));
 import { deleteCollectionDocuments } from "../documents.service";
 
 beforeEach(() => {
   vi.clearAllMocks();
   cleanup.mockResolvedValue(undefined);
+  requestDelivery.mockResolvedValue(0);
 });
 const scope = { kind: "project" as const, projectId: "p" };
 

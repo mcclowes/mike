@@ -36,8 +36,13 @@ function pollMs(): number {
     return redisEnabled() ? 60_000 : 5_000;
 }
 const CLAIM_BATCH = 5;
-/** A "running" job whose claim is older than this is presumed crashed. */
-const STALE_SECONDS = 600;
+/**
+ * A "running" job whose claim is older than this is presumed crashed.
+ * Exported because a handler that claims sibling rows of its own kind (the
+ * document.cleanup coalescer) has to use the same stale threshold this loop
+ * does, or the two disagree about who owns a row.
+ */
+export const STALE_SECONDS = 600;
 /** Retention: how long finished rows are kept for inspection. */
 const DONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const FAILED_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;

@@ -1,4 +1,7 @@
 import { type Db, type DbJob, DbJobDeferredError } from "../../lib/dbq/types";
+import { retryDelayMs, STALE_SECONDS } from "../../lib/dbq/runner";
+import { requestDocumentCleanupDelivery } from "../../lib/dbq/enqueue";
+import { logError } from "../../lib/log";
 
 import {
   assertStorageConfigured,
@@ -6,19 +9,154 @@ import {
   extractedTextKey,
 } from "../../lib/storage";
 
-/** The database trigger owns enqueueing; all deletion surfaces use this job. */
-export async function handleDocumentCleanup(
-  db: Db,
-  job: Pick<DbJob, "payload">,
-): Promise<void> {
-  const keys = [
+/**
+ * How many sibling rows one run may absorb. The trigger writes one row per
+ * mutated version, so deleting a project with a thousand documents produces
+ * thousands of rows, and the poll loop claims five per tick — a drain
+ * measured in hours (lc-01-drain.log). Coalescing turns that back into one
+ * pass over one deduplicated key set, while every row keeps its own
+ * done/failed outcome so retries stay per-row.
+ */
+const COALESCE_LIMIT = 500;
+
+type ClaimedCleanupJob = Pick<
+  DbJob,
+  "id" | "payload" | "attempts" | "claimed_at"
+>;
+
+function cleanupKeys(payload: DbJob["payload"] | undefined): string[] {
+  const raw = payload?.keys;
+  return [
     ...new Set(
-      (Array.isArray(job.payload.keys) ? job.payload.keys : []).filter(
+      (Array.isArray(raw) ? raw : []).filter(
         (key): key is string => typeof key === "string" && key.length > 0,
       ),
     ),
   ];
-  if (!keys.length) return;
+}
+
+/**
+ * Hand a coalesced row its own outcome, addressed to the claim we hold
+ * (id + running + attempts + claimed_at) exactly like the runner's fence, so
+ * this write cannot land on top of a reclaim by another runner.
+ */
+async function settleCoalescedJob(
+  db: Db,
+  row: ClaimedCleanupJob,
+  outcome:
+    | { done: true }
+    | { done: false; message: string; runAt: string; refundAttempt?: boolean },
+): Promise<void> {
+  const patch = outcome.done
+    ? {
+        status: "done",
+        finished_at: new Date().toISOString(),
+        last_error: null,
+      }
+    : {
+        status: "pending",
+        run_at: outcome.runAt,
+        last_error: outcome.message,
+        ...(outcome.refundAttempt
+          ? { attempts: Math.max(0, row.attempts - 1) }
+          : {}),
+      };
+  const { error } = await db
+    .from("db_jobs")
+    .update(patch)
+    .eq("id", row.id)
+    .eq("status", "running")
+    .eq("attempts", row.attempts)
+    .eq("claimed_at", row.claimed_at);
+  // Losing this write only costs one duplicate (idempotent) delete later.
+  if (error) logError("dbq/document-cleanup", error, { jobId: row.id });
+}
+
+/** Claim the pending cleanup backlog so one run can drain all of it. */
+async function claimSiblingCleanupJobs(
+  db: Db,
+  selfId: string,
+): Promise<ClaimedCleanupJob[]> {
+  const { data, error } = await db.rpc("claim_db_jobs", {
+    p_limit: COALESCE_LIMIT,
+    p_stale_seconds: STALE_SECONDS,
+    p_kind: "document.cleanup",
+  });
+  if (error) {
+    // A database without the kind-filtered claim (code ahead of migration)
+    // drains one row per job: slower, never wrong.
+    logError("dbq/document-cleanup", error, { phase: "coalesce" });
+    return [];
+  }
+  const siblings: ClaimedCleanupJob[] = [];
+  for (const row of (data ?? []) as DbJob[]) {
+    if (row.id === selfId) continue;
+    if (row.kind !== "document.cleanup") {
+      // Defensive: a claim that ignored the filter must not strand another
+      // kind's row in `running` until the stale threshold expires.
+      await settleCoalescedJob(db, row, {
+        done: false,
+        message: "released by document.cleanup coalescing",
+        runAt: new Date().toISOString(),
+        refundAttempt: true,
+      });
+      continue;
+    }
+    siblings.push(row);
+  }
+  return siblings;
+}
+
+/** The database trigger owns enqueueing; all deletion surfaces use this job. */
+export async function handleDocumentCleanup(
+  db: Db,
+  job: Pick<DbJob, "payload"> & Partial<Pick<DbJob, "id">>,
+): Promise<void> {
+  // Only a genuinely claimed row may claim siblings: the inline fallback
+  // below passes a synthetic job and owns nothing in db_jobs.
+  const siblings = job.id ? await claimSiblingCleanupJobs(db, job.id) : [];
+  const ownKeys = cleanupKeys(job.payload);
+  const keys = [
+    ...new Set([
+      ...ownKeys,
+      ...siblings.flatMap((row) => cleanupKeys(row.payload)),
+    ]),
+  ];
+  if (!keys.length) {
+    for (const row of siblings)
+      await settleCoalescedJob(db, row, { done: true });
+    return;
+  }
+  try {
+    await deleteCleanupKeys(db, keys, ownKeys, siblings);
+  } catch (err) {
+    // This row's outcome belongs to the runner, but the rows we claimed are
+    // ours to hand back — otherwise they wait out the stale threshold.
+    const deferred = err instanceof DbJobDeferredError;
+    for (const row of siblings)
+      await settleCoalescedJob(db, row, {
+        done: false,
+        message: err instanceof Error ? err.message : "cleanup_failed",
+        runAt: deferred
+          ? err.runAt
+          : new Date(Date.now() + retryDelayMs(row.attempts)).toISOString(),
+        refundAttempt: deferred,
+      });
+    throw err;
+  }
+}
+
+/**
+ * One pass over the merged key set. Failures are attributed back to the row
+ * that asked for each key, so a storage object that keeps rejecting deletes
+ * only retries its own row.
+ */
+async function deleteCleanupKeys(
+  db: Db,
+  keys: string[],
+  ownKeys: string[],
+  siblings: ClaimedCleanupJob[],
+): Promise<void> {
   assertStorageConfigured();
   // A precompute worker may already hold source bytes when deletion commits.
   // Wait for its claim to finish before removing its output, including a
@@ -44,29 +182,52 @@ export async function handleDocumentCleanup(
   }
   // Legacy data can share object paths. Never delete bytes a surviving
   // version still references, and fail closed if either lookup fails.
+  // Chunked like the probe above: a coalesced run carries far more keys than
+  // one row's worth, and `in(...)` travels in the request URL.
   const referenced = new Set<string>();
   for (const column of ["storage_path", "pdf_storage_path"] as const) {
-    const { data, error } = await db
-      .from("document_versions")
-      .select(column)
-      .in(column, keys)
-      .is("deleted_at", null);
-    if (error) throw error;
-    for (const row of data ?? []) {
-      const key = (row as unknown as Record<string, unknown>)[column];
-      if (typeof key === "string") referenced.add(key);
+    for (let start = 0; start < keys.length; start += 500) {
+      const { data, error } = await db
+        .from("document_versions")
+        .select(column)
+        .in(column, keys.slice(start, start + 500))
+        .is("deleted_at", null);
+      if (error) throw error;
+      for (const row of data ?? []) {
+        const key = (row as unknown as Record<string, unknown>)[column];
+        if (typeof key === "string") referenced.add(key);
+      }
     }
   }
-  let failures = 0;
+  const failed = new Set<string>();
   for (const key of keys) {
     if (referenced.has(key)) continue;
     try {
       await deleteFile(key);
     } catch {
-      failures++;
+      failed.add(key);
     }
   }
-  if (failures) throw new Error(`document_cleanup_failed:${failures}`);
+  for (const row of siblings) {
+    const rowFailures = cleanupKeys(row.payload).filter((key) =>
+      failed.has(key),
+    ).length;
+    await settleCoalescedJob(
+      db,
+      row,
+      rowFailures
+        ? {
+            done: false,
+            message: `document_cleanup_failed:${rowFailures}`,
+            runAt: new Date(
+              Date.now() + retryDelayMs(row.attempts),
+            ).toISOString(),
+          }
+        : { done: true },
+    );
+  }
+  const ownFailures = ownKeys.filter((key) => failed.has(key)).length;
+  if (ownFailures) throw new Error(`document_cleanup_failed:${ownFailures}`);
 }
 
 /** Operational queue-disable fallback. Normally the trigger is the only
@@ -118,11 +279,18 @@ export async function captureInlineDocumentCleanup(
   return [...keys];
 }
 
+/**
+ * Close out a delete's cleanup. Two halves, and normal deployments only use
+ * the second: inline deletion for the queue-disabled fallback, then a
+ * delivery request for the rows the version trigger just wrote, so a Redis
+ * deployment starts draining in milliseconds instead of at the next 60s poll.
+ */
 export async function completeInlineDocumentCleanup(
   db: Db,
   keys: string[],
 ): Promise<void> {
   if (keys.length) await handleDocumentCleanup(db, { payload: { keys } });
+  await requestDocumentCleanupDelivery(db);
 }
 
 /** Mirror the trigger's retired-key selection only when workers are disabled.
