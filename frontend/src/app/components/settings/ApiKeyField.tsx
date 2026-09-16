@@ -12,6 +12,9 @@ import { SettingsDescription, SettingsLabel } from "./SettingsText";
 import { isMfaRequiredError } from "@/app/lib/mikeApi";
 import { settingsGlassIconButtonClassName } from "@/app/(pages)/settings/settingsStyles";
 
+// The backend never returns saved keys, so the mask is a fixed-length stand-in.
+const SAVED_KEY_MASK = "x".repeat(24);
+
 export function ApiKeyField({
   label,
   description,
@@ -29,6 +32,7 @@ export function ApiKeyField({
 }) {
   const [value, setValue] = useState("");
   const [reveal, setReveal] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [pendingMfaAction, setPendingMfaAction] = useState<
@@ -40,6 +44,7 @@ export function ApiKeyField({
   }, [hasSavedKey]);
 
   const dirty = value.trim().length > 0;
+  const showMask = hasSavedKey && !isEditing && !dirty;
 
   const handleSave = async () => {
     setIsSaving(true);
@@ -110,10 +115,13 @@ export function ApiKeyField({
           <div className="relative flex-1">
             <SettingsTextInput
               aria-label={label}
-              type={reveal ? "text" : "password"}
-              value={value}
+              type={reveal && !showMask ? "text" : "password"}
+              value={showMask ? SAVED_KEY_MASK : value}
+              readOnly={showMask}
+              onFocus={() => setIsEditing(true)}
+              onBlur={() => setIsEditing(false)}
               onChange={(event) => setValue(event.target.value)}
-              placeholder={hasSavedKey ? "Saved key hidden" : placeholder}
+              placeholder={hasSavedKey ? "Enter a new key to replace" : placeholder}
               className="pr-10"
               autoComplete="off"
               spellCheck={false}
