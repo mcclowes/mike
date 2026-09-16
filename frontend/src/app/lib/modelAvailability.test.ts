@@ -6,7 +6,6 @@ import {
     isModelAvailable,
     isProviderAvailable,
     modelGroupToProvider,
-    providerLabel,
 } from "./modelAvailability";
 
 const keys = (configured: {
@@ -122,18 +121,6 @@ describe("isProviderAvailable", () => {
         expect(
             isProviderAvailable("ollama", {} as unknown as ApiKeyState),
         ).toBe(true);
-    });
-});
-
-describe("providerLabel", () => {
-    it("returns the display label for each provider", () => {
-        expect(providerLabel("claude")).toBe("Anthropic (Claude)");
-        expect(providerLabel("openai")).toBe("OpenAI");
-        expect(providerLabel("openrouter")).toBe("OpenRouter");
-        expect(providerLabel("vercel")).toBe("Vercel AI Gateway");
-        expect(providerLabel("opencode-go")).toBe("OpenCode Go");
-        expect(providerLabel("ollama")).toBe("Local (Ollama)");
-        expect(providerLabel("gemini")).toBe("Google (Gemini)");
     });
 });
 

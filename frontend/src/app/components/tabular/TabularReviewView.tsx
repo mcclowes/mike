@@ -1872,7 +1872,6 @@ export function TRView({ reviewId, projectId }: Props) {
 
             <ApiKeyMissingPopup
                 open={apiKeyModalProvider !== null}
-                provider={apiKeyModalProvider}
                 onClose={() => setApiKeyModalProvider(null)}
             />
 

@@ -40,16 +40,6 @@ export function isProviderAvailable(
     return !!apiKeys[provider]?.configured;
 }
 
-export function providerLabel(provider: ModelProvider): string {
-    if (provider === "claude") return "Anthropic (Claude)";
-    if (provider === "openai") return "OpenAI";
-    if (provider === "openrouter") return "OpenRouter";
-    if (provider === "vercel") return "Vercel AI Gateway";
-    if (provider === "opencode-go") return "OpenCode Go";
-    if (provider === "ollama") return "Local (Ollama)";
-    return "Google (Gemini)";
-}
-
 export function modelGroupToProvider(
     group: ModelOption["group"],
 ): ModelProvider {
