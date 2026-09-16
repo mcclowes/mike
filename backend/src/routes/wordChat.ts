@@ -4,6 +4,7 @@ import { requireAuth } from "../middleware/auth";
 import { createServerSupabase } from "../lib/supabase";
 import {
   AssistantStreamError,
+  assistantStreamErrorEvent,
   ASSISTANT_ERROR_MESSAGE,
   ACTIVE_WORD_DOCUMENT_ID,
   buildCancelledAssistantMessage,
@@ -1306,7 +1307,7 @@ wordChatRouter.post("/", requireAuth, async (req, res) => {
       console.error("[word-chat] failed to persist stream error", saveError);
     }
     try {
-      write(`data: ${JSON.stringify({ type: "error", message })}\n\n`);
+      write(`data: ${JSON.stringify(assistantStreamErrorEvent(error))}\n\n`);
       write("data: [DONE]\n\n");
     } catch {
       // The client disconnected while the error was being handled.

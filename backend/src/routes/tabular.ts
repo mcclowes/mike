@@ -7,6 +7,7 @@ import { sendInternalError } from "../lib/httpError";
 import { attachActiveVersionPaths } from "../lib/documentVersions";
 import {
     AssistantStreamError,
+    assistantStreamErrorEvent,
     ASSISTANT_ERROR_MESSAGE,
     buildCancelledAssistantMessage,
     isAbortError,
@@ -2650,7 +2651,7 @@ tabularRouter.post("/:reviewId/chat", requireAuth, async (req, res) => {
         }
         }
         try {
-            write(`data: ${JSON.stringify({ type: "error", message })}\n\n`);
+            write(`data: ${JSON.stringify(assistantStreamErrorEvent(err))}\n\n`);
             write("data: [DONE]\n\n");
         } catch {
             /* ignore */

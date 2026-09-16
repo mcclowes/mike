@@ -169,6 +169,18 @@ export const ASSISTANT_ERROR_MESSAGE =
   "The response could not be completed. Please try again.";
 const TOOL_ERROR_MESSAGE = "This tool could not complete its request.";
 
+/** The error event to send the client: the stream's own when it recorded one. */
+export function assistantStreamErrorEvent(
+  error: unknown,
+): Extract<AssistantEvent, { type: "error" }> {
+  const events = error instanceof AssistantStreamError ? error.events : [];
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.type === "error") return event;
+  }
+  return { type: "error", message: ASSISTANT_ERROR_MESSAGE };
+}
+
 function sanitizeAssistantEvent(event: AssistantEvent): AssistantEvent {
   if (event.type === "error") {
     return event.safe_to_display

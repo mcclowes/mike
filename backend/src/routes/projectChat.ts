@@ -12,6 +12,7 @@ import {
   appendAskInputsResponseToAssistantMessage,
   appendAssistantEventsToMessage,
   AssistantStreamError,
+  assistantStreamErrorEvent,
   ASSISTANT_ERROR_MESSAGE,
   buildCancelledAssistantMessage,
     extractCitations,
@@ -699,7 +700,7 @@ projectChatRouter.post("/", requireAuth, async (req, res) => {
         console.error("[project-chat/stream] failed to save error", saveErr);
       }
       try {
-        write(`data: ${JSON.stringify({ type: "error", message })}\n\n`);
+        write(`data: ${JSON.stringify(assistantStreamErrorEvent(err))}\n\n`);
             write("data: [DONE]\n\n");
         } catch {
             /* ignore */

@@ -10,6 +10,7 @@ import type {
   StreamChatParams,
   StreamChatResult,
 } from "./types";
+import { toProviderStreamError } from "./providerErrors";
 import { createRawLlmStreamRecorder, logRawLlmStream } from "./rawStreamLog";
 
 const MAX_OUTPUT_TOKENS = 16_384;
@@ -352,7 +353,7 @@ export async function streamAiSdk(
         case "tool-error":
           throw new Error(errorMessage(part.error, config.label));
         case "error":
-          throw new Error(errorMessage(part.error, config.label));
+          throw toProviderStreamError(part.error, config);
         case "abort": {
           const error = new Error(part.reason || "Stream aborted.");
           error.name = "AbortError";
@@ -369,7 +370,7 @@ export async function streamAiSdk(
     return { fullText };
   } catch (error) {
     await rawStreamRecorder?.flush("error", error);
-    throw error;
+    throw toProviderStreamError(error, config);
   }
 }
 
