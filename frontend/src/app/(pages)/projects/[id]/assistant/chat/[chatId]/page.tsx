@@ -2078,7 +2078,6 @@ export default function ProjectAssistantChatPage({ params }: Props) {
             )}
             <ApiKeyMissingPopup
                 open={rejectedApiKey !== null}
-                provider={rejectedKeyProvider}
                 title="API key rejected"
                 message={`${
                     rejectedKeyProvider

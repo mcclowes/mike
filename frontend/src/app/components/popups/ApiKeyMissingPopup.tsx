@@ -2,13 +2,11 @@
 
 import { useRouter } from "next/navigation";
 import { AlertTriangle } from "lucide-react";
-import { providerLabel, type ModelProvider } from "@/app/lib/modelAvailability";
 import { WarningPopup } from "../popups/WarningPopup";
 
 interface Props {
     open: boolean;
     onClose: () => void;
-    provider: ModelProvider | null;
     /** Optional override for the body sentence. */
     message?: string;
     /** Optional override for the heading — e.g. a rejected key, not a missing one. */
@@ -18,17 +16,15 @@ interface Props {
 export function ApiKeyMissingPopup({
     open,
     onClose,
-    provider,
     message,
     title,
 }: Props) {
     const router = useRouter();
     if (!open) return null;
 
-    const providerName = provider ? providerLabel(provider) : "this provider";
     const body =
         message ??
-        `You haven't added a ${providerName} API key yet. Add one in Settings to use this model.`;
+        "You haven't added an API key for this model's provider yet. Add one in Settings to use this model.";
 
     const handleGoToSettings = () => {
         onClose();
