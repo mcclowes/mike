@@ -1,8 +1,7 @@
 // Tracked-change (assistant edit) operations: listing change ids embedded in
 // the active DOCX and accepting / rejecting an individual edit.
 
-import { downloadFile, extractedTextKey, uploadFile } from "../../lib/storage";
-import { enqueueStorageCleanup } from "../../lib/dbq/enqueue";
+import { downloadFile, uploadFile } from "../../lib/storage";
 import {
     extractTrackedChangeIds,
     resolveTrackedChange,
@@ -13,6 +12,7 @@ import { ensureDocAccess } from "../../lib/access";
 import { can } from "../../lib/permissions";
 import { downloadFilenameForVersion, type Db } from "./documents.shared";
 import { ensureDocumentAccess } from "./documents.access";
+import { updateDocumentVersion } from "./documents.lifecycle";
 // devLog comes from lib/chat/types (a leaf file — importing the whole chat
 // barrel here just for a logger would be a heavy dependency edge).
 import { devLog } from "../../lib/log";
@@ -197,17 +197,6 @@ export async function resolveEdit(
         resolvedBytes.byteOffset + resolvedBytes.byteLength,
     ) as ArrayBuffer;
 
-    // Clear the hash before the bytes change, and set it again after. The stored
-    // object and the hash live in different systems, so they cannot be written
-    // atomically; ordering it this way means a failure in between leaves the
-    // version unhashed, which the manifest reports as unverifiable. The
-    // alternative ordering can leave a hash attesting to content the version no
-    // longer holds, which is the one thing the manifest must never do.
-    await db
-        .from("document_versions")
-        .update({ content_sha256: null })
-        .eq("id", doc.current_version_id);
-
     devLog(`[edit-resolution] overwriting bytes in place`, {
         latestPath,
         byteLength: ab.byteLength,
@@ -218,26 +207,47 @@ export async function resolveEdit(
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     );
 
+    // One write, through the module that owns document_versions. It is the
+    // single mutation of this version, so the cleanup trigger fires once and
+    // that one row carries every key the rewrite retires: the stale PDF
+    // rendition and the extracted-text cache entry. The keys used to arrive
+    // three times — two direct updates plus an explicit storage.cleanup enqueue
+    // — for the same object.
+    //
     // pdf_storage_path: null — the bytes just changed, so any PDF rendition
     // this version carried no longer matches them; a stale rendition would be
     // served by /display and copied onto replicas by replicate_document. In
     // practice assistant_edit versions never carry one (DOCX renders through
     // DocxView from the raw bytes), so this is an invariant write, not a
     // behavior change.
-    await db
-        .from("document_versions")
-        .update({ content_sha256: contentSha256(ab), pdf_storage_path: null })
-        .eq("id", doc.current_version_id);
-
-    // The extracted-text cache is keyed on the version id and this is one of
-    // only two sites that rewrite a version's bytes in place, so it is one of
-    // only two sites where that key could go stale. Resolution always writes
-    // DOCX, which is not a cached type, so this deletes nothing today — it is
-    // here so the "versions are immutable" assumption the cache rests on stays
-    // true by construction rather than by coincidence.
-    await enqueueStorageCleanup(db, [
-        extractedTextKey(doc.current_version_id as string),
-    ]);
+    //
+    // The helper also runs the inline capture/complete pair, which is what
+    // removes that rendition when DB_JOBS_ENABLED=false and no runner will
+    // ever drain the trigger's row. The direct updates bypassed it and leaked.
+    const { error: versionErr } = await updateDocumentVersion(
+        db,
+        documentId,
+        doc.current_version_id as string,
+        { content_sha256: contentSha256(ab), pdf_storage_path: null },
+    );
+    if (versionErr) {
+        // The object and the hash live in different systems and cannot be
+        // written atomically. The bytes are already replaced, so a version
+        // still carrying the OLD hash would attest to content it no longer
+        // holds — the one thing the manifest must never do. Clear it instead:
+        // unhashed reads as unverifiable, which is true and safe. That is the
+        // state the old clear-then-write pair reached by accident; this reaches
+        // it on purpose, and only when the write it protects actually failed.
+        devLog(`[edit-resolution] version update failed; clearing hash`, {
+            versionErr,
+        });
+        await updateDocumentVersion(
+            db,
+            documentId,
+            doc.current_version_id as string,
+            { content_sha256: null, pdf_storage_path: null },
+        );
+    }
 
     const { error: statusErr } = await db
         .from("document_edits")
