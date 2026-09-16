@@ -17,7 +17,7 @@ export function ApiKeyMissingPopup({ open, onClose, message }: Props) {
 
     const body =
         message ??
-        "You haven't added an API key for this model's provider yet. Add one in Settings to use this model.";
+        "You haven't enabled any models yet. Add an API key in settings to get started.";
 
     const handleGoToSettings = () => {
         onClose();
