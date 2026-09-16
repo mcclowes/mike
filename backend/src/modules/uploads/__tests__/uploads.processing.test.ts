@@ -19,6 +19,8 @@ const mocks = vi.hoisted(() => ({
   recordAudit: vi.fn(),
   uploadFileFromPath: vi.fn(),
   createServerSupabase: vi.fn(),
+  enqueueStorageCleanup: vi.fn(),
+  requestDocumentCleanupDelivery: vi.fn(),
 }));
 
 vi.mock("../../../lib/storage", async (importOriginal) => {
@@ -38,6 +40,10 @@ vi.mock("../../../lib/convert", async (importOriginal) => {
 });
 
 vi.mock("../../../lib/audit", () => ({ recordAudit: mocks.recordAudit }));
+vi.mock("../../../lib/dbq/enqueue", () => ({
+  enqueueStorageCleanup: mocks.enqueueStorageCleanup,
+  requestDocumentCleanupDelivery: mocks.requestDocumentCleanupDelivery,
+}));
 vi.mock("../../../lib/supabase", () => ({
   createServerSupabase: mocks.createServerSupabase,
 }));
@@ -237,6 +243,8 @@ describe("upload processing", () => {
     mocks.uploadFileFromPath.mockResolvedValue(undefined);
     mocks.deleteFile.mockResolvedValue(undefined);
     mocks.recordAudit.mockResolvedValue(undefined);
+    mocks.enqueueStorageCleanup.mockResolvedValue(undefined);
+    mocks.requestDocumentCleanupDelivery.mockResolvedValue(0);
   });
 
   afterEach(async () => {
@@ -430,6 +438,33 @@ describe("upload processing", () => {
     expect(mocks.uploadFileFromPath).not.toHaveBeenCalled();
   });
 
+  // The upsert that makes a retry idempotent is also what brings a document
+  // the user deleted mid-processing back from the dead.
+  it("refuses to recreate a document deleted while the upload was processing", async () => {
+    const db = scriptedDb([{ data: null, error: null }]);
+
+    await expect(
+      processUploadFile(db as never, baseSession, baseFile, true),
+    ).rejects.toThrow(/document_deleted/);
+
+    expect(db.calls.some((call) => call.operation === "upsert")).toBe(false);
+    expect(db.rpc).not.toHaveBeenCalled();
+    // Nothing was written to the destination either.
+    expect(mocks.copyFile).not.toHaveBeenCalled();
+  });
+
+  it("stops when the destination vanishes between the copy and the version insert", async () => {
+    const db = fakeDb();
+    db.rpc.mockResolvedValue({
+      data: null,
+      error: { code: "P0002", message: "document_not_found" },
+    } as never);
+
+    await expect(
+      processUploadFile(db as never, baseSession, baseFile, false),
+    ).rejects.toThrow(/document_deleted/);
+  });
+
   it("marks a failed created document and safely queues the job for retry", async () => {
     mocks.createFileReadStream.mockImplementation(() =>
       Readable.from(
@@ -483,6 +518,63 @@ describe("upload processing", () => {
       ]),
     );
     expect(db.remaining).toHaveLength(0);
+  });
+
+  // The measured resurrection: the job failed on P0002, retried, and the
+  // retry's upsert put the document back with status ready and its object
+  // live. A vanished destination has to end the job, not restart it.
+  it("does not retry a job whose destination document was deleted", async () => {
+    const db = scriptedDb([
+      {
+        data: {
+          id: "job-1",
+          session_id: baseSession.id,
+          file_id: baseFile.id,
+          // A retry: the first attempt is what the user deleted under.
+          attempts: 2,
+          locked_by: "worker-1",
+        },
+        error: null,
+      },
+      { data: baseSession, error: null },
+      { data: baseFile, error: null },
+      { data: { id: "job-1" }, error: null },
+      { error: null },
+      // The destination document lookup: gone.
+      { data: null, error: null },
+      { data: { id: "job-1" }, error: null },
+      { error: null },
+      { error: null },
+      { data: { id: "job-1" }, error: null },
+      { error: null },
+      { data: null, error: null },
+      { data: { id: "job-1" }, error: null },
+    ]);
+
+    await processUploadJob(db as never, "job-1", "worker-1");
+
+    expect(db.calls).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          table: "upload_session_files",
+          operation: "update",
+          payload: expect.objectContaining({ error_code: "document_deleted" }),
+        }),
+      ]),
+    );
+    // No requeue: the job finishes as a partial failure instead.
+    expect(
+      db.calls.some(
+        (call) =>
+          call.table === "upload_processing_jobs" &&
+          (call.payload as { status?: string } | undefined)?.status === "queued",
+      ),
+    ).toBe(false);
+    // The bytes this upload wrote have no row pointing at them now.
+    expect(mocks.enqueueStorageCleanup).toHaveBeenCalledWith(
+      db,
+      expect.arrayContaining([expect.stringContaining(baseFile.resource_id)]),
+    );
   });
 
   it("stops before processing when the database lease has been lost", async () => {

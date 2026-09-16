@@ -23,6 +23,7 @@ import { pathToFileURL } from "node:url";
 
 import { resolveContentOrgId } from "../../lib/access";
 import { recordAudit } from "../../lib/audit";
+import { enqueueStorageCleanup } from "../../lib/dbq/enqueue";
 import { convertedPdfKey, officeFileToPdf } from "../../lib/convert";
 import { shouldConvertToPdf } from "../../lib/documentTypes";
 import { uploadJobWallClockMs } from "../../lib/runtimeConfig";
@@ -85,7 +86,46 @@ const TERMINAL_UPLOAD_ERROR_CODES = new Set([
   "direct_upload_failed",
   "size_mismatch",
   "content_type_mismatch",
+  // The destination document no longer exists. Retrying cannot make it exist
+  // again — it can only put it back, which is the bug this code prevents.
+  "document_deleted",
 ]);
+
+/**
+ * The document this upload was destined for was deleted while it processed.
+ *
+ * Less a failure of the upload than a race the user already resolved: they
+ * asked for the document to go, and it went. The only correct outcome is to
+ * stop, mark the file failed, and clean up whatever bytes this job wrote —
+ * never to recreate the row.
+ */
+class DeletedDocumentError extends Error {
+  /** Objects this job uploaded that nothing will reference now. */
+  readonly orphanedKeys: string[];
+
+  constructor(documentId: string, orphanedKeys: (string | null)[] = []) {
+    super(`document_deleted:${documentId}`);
+    this.name = "DeletedDocumentError";
+    this.orphanedKeys = orphanedKeys.filter(
+      (key): key is string => typeof key === "string" && key.length > 0,
+    );
+  }
+}
+
+/**
+ * create_document_version raises document_not_found (P0002) when the parent
+ * row is gone. Before the lifecycle RPCs the same race surfaced as a foreign
+ * key violation (23503) on the versions insert; both are recognised so this
+ * still holds if a caller ever inserts directly again.
+ */
+function isMissingDocumentError(error: unknown): boolean {
+  const { code, message } = (error ?? {}) as {
+    code?: unknown;
+    message?: unknown;
+  };
+  if (code === "P0002" || code === "23503") return true;
+  return typeof message === "string" && message.includes("document_not_found");
+}
 
 type SealedFileArtifact = {
   directory: string;
@@ -235,6 +275,7 @@ async function processCreatedDocument(
   session: UploadSessionRow,
   file: UploadFileRow,
   artifact: SealedFileArtifact,
+  isRetry: boolean,
 ) {
   const destination = session.destination;
   const scope = destination.scope as
@@ -286,6 +327,24 @@ async function processCreatedDocument(
     orgId = (workflowRow as { org_id?: string | null } | null)?.org_id ?? null;
   }
 
+  // The upsert below is what makes a retry idempotent — and, on a retry, what
+  // would silently RESURRECT a document the user deleted while this job was
+  // running. The first attempt legitimately creates the row; from the second
+  // attempt on, a row that is not there is not there because it was removed.
+  if (isRetry) {
+    const { data: existing, error: existingError } = await db
+      .from("documents")
+      .select("id")
+      .eq("id", documentId)
+      .maybeSingle();
+    if (existingError) throw existingError;
+    if (!existing)
+      throw new DeletedDocumentError(documentId, [
+        storageKey(session.user_id, documentId, file.filename),
+        convertedPdfKey(session.user_id, documentId),
+      ]);
+  }
+
   const { error: documentError } = await db.from("documents").upsert(
     {
       id: documentId,
@@ -328,6 +387,10 @@ async function processCreatedDocument(
     page_count: pageCount,
     content_sha256: artifact.sha256,
   });
+  // The document went while we were converting: stop, and hand the bytes we
+  // just uploaded to cleanup rather than leaving them for a retry to adopt.
+  if (versionError && isMissingDocumentError(versionError))
+    throw new DeletedDocumentError(documentId, [sourcePath, pdfPath]);
   if (versionError) throw versionError;
 
   const { data: document, error: updateError } = await db
@@ -414,6 +477,10 @@ async function processNewDocumentVersion(
     page_count: pageCount,
     content_sha256: artifact.sha256,
   });
+  // Adding a version to a document that has been deleted is the same race as
+  // the create path, with the same answer: stop, and clean up these bytes.
+  if (error && isMissingDocumentError(error))
+    throw new DeletedDocumentError(documentId, [sourcePath, pdfPath]);
   if (error || !version)
     throw error ?? new Error("version_insert_returned_no_data");
 
@@ -504,12 +571,19 @@ export async function processUploadFile(
   db: Db,
   session: UploadSessionRow,
   file: UploadFileRow,
+  isRetry = false,
 ) {
   const artifact = await requireSealedFile(file);
   try {
     switch (session.purpose) {
       case "document_create":
-        return await processCreatedDocument(db, session, file, artifact);
+        return await processCreatedDocument(
+          db,
+          session,
+          file,
+          artifact,
+          isRetry,
+        );
       case "document_version_create":
         return await processNewDocumentVersion(db, session, file, artifact);
       case "document_version_replace":
@@ -534,6 +608,7 @@ export async function processUploadFile(
           },
           file,
           artifact,
+          isRetry,
         );
       case "workflow_reference_replace":
         // A former replacement is retained as a new version so history is not
@@ -676,6 +751,7 @@ export async function processUploadJob(
   heartbeat.unref();
 
   let failed = false;
+  let documentDeleted = false;
   try {
     if (file.status !== "completed" && !terminalUploadFailure) {
       await heartbeatJob(db, jobId, workerId);
@@ -692,12 +768,19 @@ export async function processUploadJob(
 
       let result: unknown;
       try {
-        result = await processUploadFile(db, typedSession, file);
+        result = await processUploadFile(
+          db,
+          typedSession,
+          file,
+          typedJob.attempts > 1,
+        );
       } catch (error) {
         // A failed timer heartbeat makes ownership uncertain. Re-prove the
         // lease before recording even a failure result.
         await heartbeatJob(db, jobId, workerId);
         failed = true;
+        // A deleted destination is the one failure a retry makes WORSE.
+        documentDeleted = error instanceof DeletedDocumentError;
         console.error("[upload-worker] file processing failed", {
           jobId,
           sessionId: typedSession.id,
@@ -709,12 +792,19 @@ export async function processUploadJob(
           .from("upload_session_files")
           .update({
             status: "error",
-            error_code: "processing_failed",
+            error_code: documentDeleted
+              ? "document_deleted"
+              : "processing_failed",
             updated_at: new Date().toISOString(),
           })
           .eq("id", file.id)
           .eq("session_id", typedSession.id);
         if (updateError) throw updateError;
+        if (error instanceof DeletedDocumentError) {
+          // Durable, best-effort: these objects have no row pointing at them
+          // any more, so this job is the last place that knows their keys.
+          await enqueueStorageCleanup(db, error.orphanedKeys);
+        }
         await markCreatedDocumentFailed(db, typedSession, file);
         await heartbeatJob(db, jobId, workerId);
       }
@@ -743,7 +833,14 @@ export async function processUploadJob(
   }
 
   const now = new Date().toISOString();
-  if (failed && typedJob.attempts < UPLOAD_JOB_MAX_ATTEMPTS) {
+  // `documentDeleted` sits outside the attempt budget on purpose: retrying a
+  // vanished destination cannot succeed, and the retry is exactly what put
+  // the deleted document back.
+  if (
+    failed &&
+    !documentDeleted &&
+    typedJob.attempts < UPLOAD_JOB_MAX_ATTEMPTS
+  ) {
     const retryAt = new Date(
       Date.now() + typedJob.attempts * 5_000,
     ).toISOString();
